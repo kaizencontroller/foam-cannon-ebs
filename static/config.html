@@ -20,6 +20,7 @@
       border-radius: 12px;
       padding: 16px;
       background: #24242a;
+      max-width: 980px;
     }
 
     h1 {
@@ -31,11 +32,19 @@
       font-size: 16px;
       margin-top: 18px;
       margin-bottom: 8px;
+      border-top: 1px solid #3a3a42;
+      padding-top: 14px;
     }
 
     .status {
       margin: 8px 0;
       font-size: 15px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+      gap: 8px 18px;
     }
 
     button {
@@ -45,6 +54,10 @@
       border-radius: 8px;
       cursor: pointer;
       font-weight: bold;
+    }
+
+    button:hover {
+      filter: brightness(1.08);
     }
 
     input, select {
@@ -74,11 +87,108 @@
       color: #18181b;
     }
 
+    .primary {
+      background: #9147ff;
+      color: white;
+    }
+
     .small {
       font-size: 12px;
       opacity: 0.75;
       margin-top: 12px;
       line-height: 1.4;
+    }
+
+    .setup-list {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 8px;
+      margin-top: 8px;
+    }
+
+    .check-card {
+      border: 1px solid #3f3f48;
+      border-radius: 10px;
+      padding: 10px;
+      background: #1f1f25;
+    }
+
+    .check-title {
+      font-weight: bold;
+      margin-bottom: 4px;
+    }
+
+    .check-ok {
+      color: #72e28a;
+    }
+
+    .check-bad {
+      color: #ff7676;
+    }
+
+    .check-detail {
+      font-size: 12px;
+      opacity: 0.8;
+      line-height: 1.35;
+    }
+
+    .event-log {
+      max-height: 320px;
+      overflow-y: auto;
+      border: 1px solid #3f3f48;
+      border-radius: 10px;
+      background: #1f1f25;
+      padding: 8px;
+      margin-top: 8px;
+    }
+
+    .event-row {
+      border-bottom: 1px solid #33333a;
+      padding: 8px 4px;
+      font-size: 13px;
+      line-height: 1.35;
+    }
+
+    .event-row:last-child {
+      border-bottom: none;
+    }
+
+    .event-time {
+      opacity: 0.65;
+      font-size: 11px;
+      margin-right: 6px;
+    }
+
+    .event-type {
+      opacity: 0.8;
+      font-size: 11px;
+      text-transform: uppercase;
+      margin-right: 6px;
+    }
+
+    .event-info {
+      color: #d7d7e0;
+    }
+
+    .event-success {
+      color: #72e28a;
+    }
+
+    .event-warning {
+      color: #f5c542;
+    }
+
+    .event-error {
+      color: #ff7676;
+    }
+
+    .message-box {
+      border: 1px solid #3f3f48;
+      border-radius: 10px;
+      background: #1f1f25;
+      padding: 10px;
+      margin-top: 14px;
+      line-height: 1.35;
     }
   </style>
 </head>
@@ -87,19 +197,29 @@
   <div class="card">
     <h1>Kaizen Foam Cannon Streamer Controls</h1>
 
-    <div class="status">Loaded Shots: <strong id="shots">?</strong></div>
-    <div class="status">Firing Now: <strong id="pending">?</strong></div>
-    <div class="status">Queued Shots: <strong id="queued">?</strong></div>
-    <div class="status">Unreserved Loaded: <strong id="unreserved">?</strong></div>
-    <div class="status">Queue Capacity Remaining: <strong id="queueCapacityRemaining">?</strong></div>
-    <div class="status">Capacity: <strong id="capacityDisplay">?</strong></div>
-    <div class="status">Mode: <strong id="mode">Loading...</strong></div>
-    <div class="status">Payment Mode: <strong id="paymentModeDisplay">Loading...</strong></div>
-    <div class="status">JWT Enforcement: <strong id="jwtEnforcement">?</strong></div>
-    <div class="status">Local Control: <strong id="connection">Checking...</strong></div>
-    <div class="status">Streamer.bot: <strong id="streamerbot">Checking...</strong></div>
-    <div class="status">Command State: <strong id="busy">Checking...</strong></div>
-    <div class="status">Random Queue Next Release: <strong id="randomNext">?</strong></div>
+    <div class="grid">
+      <div class="status">Loaded Shots: <strong id="shots">?</strong></div>
+      <div class="status">Firing Now: <strong id="pending">?</strong></div>
+      <div class="status">Queued Shots: <strong id="queued">?</strong></div>
+      <div class="status">Unreserved Loaded: <strong id="unreserved">?</strong></div>
+      <div class="status">Queue Capacity Remaining: <strong id="queueCapacityRemaining">?</strong></div>
+      <div class="status">Capacity: <strong id="capacityDisplay">?</strong></div>
+      <div class="status">Mode: <strong id="mode">Loading...</strong></div>
+      <div class="status">Payment Mode: <strong id="paymentModeDisplay">Loading...</strong></div>
+      <div class="status">JWT Enforcement: <strong id="jwtEnforcement">?</strong></div>
+      <div class="status">Local Control: <strong id="connection">Checking...</strong></div>
+      <div class="status">Streamer.bot: <strong id="streamerbot">Checking...</strong></div>
+      <div class="status">Command State: <strong id="busy">Checking...</strong></div>
+      <div class="status">Random Queue Next Release: <strong id="randomNext">?</strong></div>
+    </div>
+
+    <h2>Setup Status</h2>
+    <div id="setupChecks" class="setup-list">
+      <div class="check-card">
+        <div class="check-title">Loading setup status...</div>
+        <div class="check-detail">Waiting for backend status.</div>
+      </div>
+    </div>
 
     <h2>Load / Mode</h2>
 
@@ -109,10 +229,10 @@
     </label>
 
     <div>
-      <button id="reload">Reload</button>
-      <button id="liveFire">Live Fire</button>
-      <button id="openQueue" class="queue">Open Queue</button>
-      <button id="disable" class="danger">Disable</button>
+      <button id="reload" class="primary">Reload</button>
+      <button id="liveFire">Fire Immediately</button>
+      <button id="openQueue" class="queue">Queue Only</button>
+      <button id="disable" class="danger">Disable Cannon</button>
       <button id="empty">Set Empty</button>
     </div>
 
@@ -145,14 +265,14 @@
       <button id="fireNext1">Fire Queued 1</button>
       <button id="fireNext3">Fire Queued 3</button>
       <button id="fireAll">Fire All Queued</button>
-      <button id="clearQueue">Clear Queue</button>
+      <button id="clearQueue" class="danger">Clear Queue</button>
     </div>
 
     <h2>Queue Settings</h2>
 
     <label>
       <input id="allowOverqueue" type="checkbox" />
-      Allow Queue Beyond Loaded Darts
+      Allow Reload Queue / Queue Beyond Loaded Darts
     </label>
 
     <label>
@@ -162,7 +282,7 @@
 
     <label>
       <input id="autoFireQueue" type="checkbox" />
-      Auto-Fire Queue in Live Fire Mode
+      Auto-Fire Queue in Fire Immediately Mode
     </label>
 
     <label>
@@ -204,7 +324,16 @@
 
     <button id="saveQueueSettings">Save Queue Settings</button>
 
-    <p id="message">Loading backend status...</p>
+    <h2>Recent Events</h2>
+    <div id="eventLog" class="event-log">
+      <div class="event-row">Loading recent events...</div>
+    </div>
+
+    <div class="message-box">
+      <strong>System Message:</strong>
+      <span id="message">Loading backend status...</span>
+    </div>
+
     <p class="small" id="debug">Waiting for Twitch authorization...</p>
   </div>
 
@@ -236,9 +365,9 @@
     }
 
     function formatMode(mode) {
-      if (mode === "live_fire") return "Live Fire";
-      if (mode === "queue_only") return "Open Queue";
-      if (mode === "disabled") return "Disabled";
+      if (mode === "live_fire") return "Fire Immediately";
+      if (mode === "queue_only") return "Queue Only";
+      if (mode === "disabled") return "Cannon Disabled";
       return mode;
     }
 
@@ -254,6 +383,16 @@
 
       if (seconds <= 0) return "Due now";
       return `${seconds} sec`;
+    }
+
+    function formatEventTime(timestamp) {
+      if (!timestamp) return "";
+      const date = new Date(timestamp * 1000);
+      return date.toLocaleTimeString([], {
+        hour: "numeric",
+        minute: "2-digit",
+        second: "2-digit"
+      });
     }
 
     function basePayload() {
@@ -286,6 +425,64 @@
         random_burst_max: intValue("randomBurstMax", 3),
         random_fixed_batch_size: intValue("randomFixedBatchSize", 1)
       };
+    }
+
+    function renderSetupChecks(checks) {
+      const container = document.getElementById("setupChecks");
+
+      if (!checks || checks.length === 0) {
+        container.innerHTML = `
+          <div class="check-card">
+            <div class="check-title check-bad">No setup status available</div>
+            <div class="check-detail">Backend did not return setup checks.</div>
+          </div>
+        `;
+        return;
+      }
+
+      container.innerHTML = checks.map((check) => {
+        const icon = check.ok ? "✅" : "❌";
+        const titleClass = check.ok ? "check-ok" : "check-bad";
+
+        return `
+          <div class="check-card">
+            <div class="check-title ${titleClass}">${icon} ${escapeHtml(check.label)}</div>
+            <div class="check-detail">${escapeHtml(check.detail || "")}</div>
+          </div>
+        `;
+      }).join("");
+    }
+
+    function renderEvents(events) {
+      const container = document.getElementById("eventLog");
+
+      if (!events || events.length === 0) {
+        container.innerHTML = `<div class="event-row">No events yet.</div>`;
+        return;
+      }
+
+      container.innerHTML = events.map((event) => {
+        const level = event.level || "info";
+        const levelClass = `event-${level}`;
+        const eventType = event.event_type || "event";
+
+        return `
+          <div class="event-row ${levelClass}">
+            <span class="event-time">${escapeHtml(formatEventTime(event.timestamp))}</span>
+            <span class="event-type">${escapeHtml(eventType)}</span>
+            <span>${escapeHtml(event.message || "")}</span>
+          </div>
+        `;
+      }).join("");
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
     }
 
     async function doAction(path, payload) {
@@ -329,7 +526,7 @@
           formatPaymentMode(data.payment_mode || "free_test");
         document.getElementById("paymentMode").value = data.payment_mode || "free_test";
         document.getElementById("jwtEnforcement").textContent =
-          data.jwt_enforcement ? "On" : "Off";
+          data.jwt_enforcement ? "On" : "Off for development";
         document.getElementById("connection").textContent =
           data.connection_status === "online" ? "Online" : "Offline";
         document.getElementById("streamerbot").textContent =
@@ -349,6 +546,9 @@
         document.getElementById("randomBurstMax").value = data.random_burst_max;
         document.getElementById("randomFixedBatchSize").value = data.random_fixed_batch_size;
 
+        renderSetupChecks(data.setup_checks || []);
+        renderEvents(data.recent_events || []);
+
         document.getElementById("message").textContent =
           data.viewer_message || data.last_fire_result || "Backend connected.";
 
@@ -359,6 +559,7 @@
         document.getElementById("streamerbot").textContent = "Unknown";
         document.getElementById("busy").textContent = "Unknown";
         document.getElementById("message").textContent = "Could not reach EBS.";
+        renderSetupChecks([]);
       } finally {
         isRefreshing = false;
       }

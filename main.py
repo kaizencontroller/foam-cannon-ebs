@@ -37,6 +37,8 @@ PAYMENT_BITS = "bits"
 
 TWITCH_EXTENSION_SECRET = os.getenv("TWITCH_EXTENSION_SECRET", "").strip()
 
+MAX_EVENT_LOG = 100
+
 
 channels = {
     DEFAULT_CHANNEL_ID: {
@@ -119,6 +121,9 @@ channels = {
                 "last_seen": None,
                 "last_fire_result": "No shots fired yet.",
                 "pending_commands": {},
+
+                # Streamer-facing diagnostics
+                "event_log": [],
             }
         }
     }
@@ -194,6 +199,23 @@ class BitsTransactionRequest(BaseModel):
     transaction_receipt: dict[str, Any] | None = None
 
 
+def log_event(turret, event_type: str, message: str, level: str = "info", extra: dict[str, Any] | None = None):
+    event = {
+        "timestamp": time.time(),
+        "event_type": event_type,
+        "level": level,
+        "message": message,
+        "extra": extra or {},
+    }
+
+    turret.setdefault("event_log", []).insert(0, event)
+    turret["event_log"] = turret["event_log"][:MAX_EVENT_LOG]
+
+
+def get_recent_events(turret, limit: int = 25):
+    return turret.get("event_log", [])[:limit]
+
+
 def decode_twitch_extension_jwt(authorization_header: str | None):
     """
     Verifies the Twitch Extension JWT if TWITCH_EXTENSION_SECRET is configured.
@@ -223,10 +245,8 @@ def decode_twitch_extension_jwt(authorization_header: str | None):
     token = authorization_header.split(" ", 1)[1].strip()
 
     try:
-        # Twitch Extension shared secrets are commonly provided as base64 strings.
         secret_bytes = base64.b64decode(TWITCH_EXTENSION_SECRET)
     except Exception:
-        # Fall back to raw secret bytes if decoding fails.
         secret_bytes = TWITCH_EXTENSION_SECRET.encode("utf-8")
 
     try:
@@ -305,6 +325,7 @@ def auto_disable_turret(turret, reason: str):
     turret["pending_commands"] = {}
     turret["random_release_next_at"] = None
     turret["last_fire_result"] = reason
+    log_event(turret, "auto_disable", reason, "warning")
 
 
 def get_can_fire_now(turret):
@@ -358,6 +379,67 @@ def get_viewer_message(turret):
     return turret["last_fire_result"] or "Ready."
 
 
+def format_setup_checks(turret):
+    ebs_online = True
+    local_control_online = turret["connection_status"] == "online"
+    streamerbot_online = turret["streamerbot_status"] == "online"
+    cannon_armed = turret["operation_mode"] != MODE_DISABLED
+    has_loaded_shots = turret["available_shots"] > 0
+    not_busy = not turret["is_busy"]
+    payment_selected = turret["payment_mode"] in {PAYMENT_FREE_TEST, PAYMENT_BITS}
+
+    return [
+        {
+            "key": "ebs",
+            "label": "Hosted EBS online",
+            "ok": ebs_online,
+            "detail": "Backend is responding.",
+        },
+        {
+            "key": "local_control",
+            "label": "Local control connected",
+            "ok": local_control_online,
+            "detail": "Connected." if local_control_online else "Local-control client is not connected.",
+        },
+        {
+            "key": "streamerbot",
+            "label": "Streamer.bot online",
+            "ok": streamerbot_online,
+            "detail": turret["streamerbot_detail"] if not streamerbot_online else "Health check accepted.",
+        },
+        {
+            "key": "cannon_armed",
+            "label": "Cannon armed",
+            "ok": cannon_armed,
+            "detail": f"Mode: {turret['operation_mode']}.",
+        },
+        {
+            "key": "loaded_shots",
+            "label": "Darts loaded",
+            "ok": has_loaded_shots,
+            "detail": f"{turret['available_shots']} loaded, {turret['queued_shots']} queued, {turret['pending_shots']} firing.",
+        },
+        {
+            "key": "not_busy",
+            "label": "Ready for command",
+            "ok": not_busy,
+            "detail": "Ready." if not_busy else "A fire command is currently processing.",
+        },
+        {
+            "key": "payment_mode",
+            "label": "Payment mode selected",
+            "ok": payment_selected,
+            "detail": f"Payment mode: {turret['payment_mode']}.",
+        },
+        {
+            "key": "jwt",
+            "label": "JWT enforcement",
+            "ok": bool(TWITCH_EXTENSION_SECRET),
+            "detail": "On." if TWITCH_EXTENSION_SECRET else "Off for development/testing.",
+        },
+    ]
+
+
 def reserve_for_fire(turret, count: int, source: str):
     if source == "live_fire":
         if count > get_physical_fireable_shots(turret):
@@ -401,6 +483,13 @@ def add_to_queue(turret, count: int, source_label: str):
 
     turret["queued_shots"] += count
     turret["last_fire_result"] = f"{source_label}: queued {count} shot(s)."
+    log_event(
+        turret,
+        "queue_add",
+        f"{source_label}: queued {count} shot(s).",
+        "info",
+        {"count": count, "source": source_label},
+    )
 
     return {
         "ok": True,
@@ -448,6 +537,13 @@ async def send_fire_command(channel_id: str, turret_id: str, count: int, source:
     reserved_ok, reserve_error = reserve_for_fire(turret, count, source)
 
     if not reserved_ok:
+        log_event(
+            turret,
+            "fire_blocked",
+            reserve_error,
+            "warning",
+            {"count": count, "source": source},
+        )
         return {
             "ok": False,
             "error": reserve_error,
@@ -474,6 +570,14 @@ async def send_fire_command(channel_id: str, turret_id: str, count: int, source:
             "created_at": time.time(),
         }
         turret["last_fire_result"] = f"Processing command {command_id} for {count} shot(s)."
+
+        log_event(
+            turret,
+            "fire_sent",
+            f"Sent {count} shot(s) to local-control.",
+            "info",
+            {"command_id": command_id, "count": count, "source": source},
+        )
 
         await websocket.send_json(command)
 
@@ -525,6 +629,13 @@ async def random_release_worker(channel_id: str, turret_id: str):
 
         turret["random_release_next_at"] = time.time() + delay
         turret["last_fire_result"] = f"Random queue release scheduled in {delay:.1f} second(s)."
+        log_event(
+            turret,
+            "random_release_scheduled",
+            f"Random queue release scheduled in {delay:.1f} second(s).",
+            "info",
+            {"delay": delay},
+        )
 
         await asyncio.sleep(delay)
 
@@ -556,6 +667,12 @@ async def random_release_worker(channel_id: str, turret_id: str):
         if physical_fireable <= 0:
             turret["random_release_next_at"] = None
             turret["last_fire_result"] = "Queued shots remain, but reload is needed before random release can continue."
+            log_event(
+                turret,
+                "reload_needed",
+                "Queued shots remain, but reload is needed before random release can continue.",
+                "warning",
+            )
             return
 
         requested_burst = get_random_burst_count(turret)
@@ -643,6 +760,7 @@ async def start_next_queued_batch_if_allowed(channel_id: str, turret_id: str):
 
     if physical_fireable <= 0:
         turret["last_fire_result"] = "Queued shots remain, but reload is needed."
+        log_event(turret, "reload_needed", "Queued shots remain, but reload is needed.", "warning")
         return
 
     count_to_fire = min(
@@ -672,6 +790,13 @@ async def apply_fire_result(channel_id: str, turret_id: str, command_id: str, ok
             f"Received result for unknown command {command_id}: "
             f"{'OK' if ok else 'FAILED'} {detail}"
         )
+        log_event(
+            turret,
+            "fire_result_unknown",
+            turret["last_fire_result"],
+            "warning",
+            {"command_id": command_id, "ok": ok, "detail": detail},
+        )
         return
 
     count = int(pending["count"])
@@ -686,10 +811,26 @@ async def apply_fire_result(channel_id: str, turret_id: str, command_id: str, ok
             f"{count} shot(s) confirmed accepted by Streamer.bot. {detail}"
         )
 
+        log_event(
+            turret,
+            "fire_success",
+            f"Fire command OK. {count} shot(s) deducted.",
+            "success",
+            {"command_id": command_id, "count": count, "source": source, "detail": detail},
+        )
+
         await start_next_queued_batch_if_allowed(channel_id, turret_id)
 
     else:
         restore_failed_fire_reservation(turret, count, source)
+
+        log_event(
+            turret,
+            "fire_failed",
+            f"Fire command failed. No shots deducted. {detail}",
+            "error",
+            {"command_id": command_id, "count": count, "source": source, "detail": detail},
+        )
 
         auto_disable_turret(
             turret,
@@ -708,6 +849,7 @@ def root():
         "panel": "/panel.html",
         "config": "/config.html",
         "status_endpoint": "/api/status",
+        "events_endpoint": "/api/events",
         "control_websocket": "/ws/control",
         "jwt_enforcement": bool(TWITCH_EXTENSION_SECRET),
     }
@@ -721,6 +863,25 @@ def serve_panel():
 @app.get("/config.html")
 def serve_config():
     return FileResponse(STATIC_DIR / "config.html")
+
+
+@app.get("/api/events")
+def events(
+    channel_id: str = DEFAULT_CHANNEL_ID,
+    turret_id: str = DEFAULT_TURRET_ID,
+    limit: int = 25,
+):
+    try:
+        turret = get_turret(channel_id, turret_id)
+    except KeyError as error:
+        return {"ok": False, "error": str(error)}
+
+    safe_limit = max(1, min(limit, MAX_EVENT_LOG))
+
+    return {
+        "ok": True,
+        "events": get_recent_events(turret, safe_limit),
+    }
 
 
 @app.get("/api/status")
@@ -768,6 +929,8 @@ def status(
         "bits_products": turret["bits_products"],
         "bits_mode_active": turret["payment_mode"] == PAYMENT_BITS,
         "jwt_enforcement": bool(TWITCH_EXTENSION_SECRET),
+        "setup_checks": format_setup_checks(turret),
+        "recent_events": get_recent_events(turret, 15),
         "connection_status": turret["connection_status"],
         "streamerbot_status": turret["streamerbot_status"],
         "streamerbot_detail": turret["streamerbot_detail"],
@@ -853,6 +1016,13 @@ async def request_shots_with_transaction(
         return {"ok": False, "error": str(error)}
 
     if turret["payment_mode"] != PAYMENT_BITS:
+        log_event(
+            turret,
+            "bits_rejected",
+            "Bits transaction rejected because payment mode is not Bits.",
+            "warning",
+            {"transaction_id": request.transaction_id, "sku": request.sku},
+        )
         return {
             "ok": False,
             "error": "Bits transaction received, but payment mode is not set to bits.",
@@ -861,6 +1031,13 @@ async def request_shots_with_transaction(
     jwt_result = decode_twitch_extension_jwt(authorization)
 
     if not jwt_result["ok"]:
+        log_event(
+            turret,
+            "bits_jwt_rejected",
+            jwt_result["error"],
+            "error",
+            {"transaction_id": request.transaction_id, "sku": request.sku},
+        )
         return {
             "ok": False,
             "error": jwt_result["error"],
@@ -870,6 +1047,13 @@ async def request_shots_with_transaction(
         return {"ok": False, "error": "Missing transaction ID."}
 
     if request.transaction_id in turret["processed_transactions"]:
+        log_event(
+            turret,
+            "bits_duplicate",
+            f"Duplicate transaction ignored: {request.transaction_id}.",
+            "warning",
+            {"transaction_id": request.transaction_id, "sku": request.sku},
+        )
         return {
             "ok": False,
             "error": "Duplicate transaction ignored.",
@@ -914,6 +1098,20 @@ async def request_shots_with_transaction(
         "status": "received",
     }
 
+    log_event(
+        turret,
+        "bits_received",
+        f"Bits transaction received: {expected_bits} Bits for {shot_count} shot(s).",
+        "info",
+        {
+            "transaction_id": request.transaction_id,
+            "sku": request.sku,
+            "bits": expected_bits,
+            "shots": shot_count,
+            "jwt_enforced": jwt_result.get("enforced", False),
+        },
+    )
+
     result = await request_shots(ShotRequest(
         channel_id=request.channel_id,
         turret_id=request.turret_id,
@@ -929,6 +1127,18 @@ async def request_shots_with_transaction(
     result["sku"] = request.sku
     result["bits"] = expected_bits
     result["jwt_enforced"] = jwt_result.get("enforced", False)
+
+    log_event(
+        turret,
+        "bits_result",
+        f"Bits transaction {request.transaction_id} result: {'accepted' if result.get('ok') else 'failed'}.",
+        "success" if result.get("ok") else "error",
+        {
+            "transaction_id": request.transaction_id,
+            "sku": request.sku,
+            "result": result,
+        },
+    )
 
     return result
 
@@ -986,6 +1196,14 @@ def reload(request: ReloadRequest):
         f"Reloaded to {request.capacity}. Queue preserved at {turret['queued_shots']} shot(s)."
     )
 
+    log_event(
+        turret,
+        "reload",
+        f"Reloaded to {request.capacity}. Queue preserved at {turret['queued_shots']} shot(s).",
+        "success",
+        {"capacity": request.capacity, "queued_shots": turret["queued_shots"]},
+    )
+
     return {
         "ok": True,
         "message": (
@@ -1021,9 +1239,19 @@ async def set_mode(request: ModeRequest):
             "error": "Cannot arm Foam Cannon while local control or Streamer.bot is offline.",
         }
 
+    previous_mode = turret["operation_mode"]
+
     turret["operation_mode"] = request.operation_mode
     turret["enabled"] = is_enabled(turret)
     turret["last_fire_result"] = f"Mode changed to {request.operation_mode}."
+
+    log_event(
+        turret,
+        "mode_change",
+        f"Mode changed from {previous_mode} to {request.operation_mode}.",
+        "info",
+        {"previous_mode": previous_mode, "new_mode": request.operation_mode},
+    )
 
     if request.operation_mode == MODE_LIVE_FIRE:
         await start_next_queued_batch_if_allowed(request.channel_id, request.turret_id)
@@ -1050,8 +1278,18 @@ def set_payment_settings(request: PaymentSettingsRequest):
             "error": "Invalid payment mode. Use free_test or bits.",
         }
 
+    previous_mode = turret["payment_mode"]
+
     turret["payment_mode"] = request.payment_mode
     turret["last_fire_result"] = f"Payment mode set to {request.payment_mode}."
+
+    log_event(
+        turret,
+        "payment_mode_change",
+        f"Payment mode changed from {previous_mode} to {request.payment_mode}.",
+        "info",
+        {"previous_mode": previous_mode, "new_mode": request.payment_mode},
+    )
 
     return {
         "ok": True,
@@ -1100,6 +1338,24 @@ async def set_queue_settings(request: QueueSettingsRequest):
 
     turret["last_fire_result"] = "Queue settings updated."
 
+    log_event(
+        turret,
+        "queue_settings",
+        "Queue settings updated.",
+        "info",
+        {
+            "allow_overqueue": request.allow_overqueue,
+            "max_queue_size": request.max_queue_size,
+            "random_queue_release": request.random_queue_release,
+            "random_min_seconds": request.random_min_seconds,
+            "random_max_seconds": request.random_max_seconds,
+            "random_burst_enabled": request.random_burst_enabled,
+            "random_burst_min": request.random_burst_min,
+            "random_burst_max": request.random_burst_max,
+            "random_fixed_batch_size": request.random_fixed_batch_size,
+        },
+    )
+
     schedule_random_release_if_needed(request.channel_id, request.turret_id)
 
     return {
@@ -1123,6 +1379,8 @@ async def set_auto_fire_queue(request: AutoFireQueueRequest):
     turret["last_fire_result"] = (
         f"Auto-fire queue set to {'ON' if turret['auto_fire_queue'] else 'OFF'}."
     )
+
+    log_event(turret, "auto_fire_queue", turret["last_fire_result"], "info")
 
     await start_next_queued_batch_if_allowed(request.channel_id, request.turret_id)
 
@@ -1180,6 +1438,8 @@ def set_empty(request: TurretActionRequest):
     turret["random_release_next_at"] = None
     turret["last_fire_result"] = "Shot count set to empty. Queue cleared."
 
+    log_event(turret, "set_empty", "Shot count set to empty. Queue cleared.", "warning")
+
     return {
         "ok": True,
         "message": "Shot count set to empty. Queue cleared.",
@@ -1202,9 +1462,13 @@ def clear_queue(request: TurretActionRequest):
             "error": "Cannot clear queue while turret is firing.",
         }
 
+    cleared_count = turret["queued_shots"]
+
     turret["queued_shots"] = 0
     turret["random_release_next_at"] = None
     turret["last_fire_result"] = "Queue cleared."
+
+    log_event(turret, "queue_clear", f"Queue cleared. Removed {cleared_count} shot(s).", "warning")
 
     return {
         "ok": True,
@@ -1245,6 +1509,7 @@ async def fire_queue(request: FireQueueRequest):
     physical_fireable = get_physical_fireable_shots(turret)
 
     if physical_fireable <= 0:
+        log_event(turret, "reload_needed", "No loaded shots available. Reload needed.", "warning")
         return {"ok": False, "error": "No loaded shots available. Reload needed."}
 
     count_to_fire = turret["queued_shots"] if request.count is None else int(request.count)
@@ -1310,6 +1575,19 @@ async def control_socket(websocket: WebSocket):
         turret["last_seen"] = time.time()
         turret["last_fire_result"] = "Local control client connected."
 
+        log_event(
+            turret,
+            "local_control_connected",
+            "Local control client connected.",
+            "success",
+            {
+                "channel_id": channel_id,
+                "turret_id": turret_id,
+                "streamerbot_status": turret["streamerbot_status"],
+                "streamerbot_detail": turret["streamerbot_detail"],
+            },
+        )
+
         if turret["streamerbot_status"] != "online":
             auto_disable_turret(
                 turret,
@@ -1334,6 +1612,12 @@ async def control_socket(websocket: WebSocket):
                 turret["streamerbot_detail"] = message.get("streamerbot_detail", "")
 
                 if turret["streamerbot_status"] != "online":
+                    log_event(
+                        turret,
+                        "streamerbot_offline",
+                        f"Streamer.bot offline: {turret['streamerbot_detail']}",
+                        "warning",
+                    )
                     auto_disable_turret(
                         turret,
                         f"Auto-disabled because Streamer.bot is offline. {turret['streamerbot_detail']}"
@@ -1342,6 +1626,12 @@ async def control_socket(websocket: WebSocket):
                 elif previous_streamerbot_status != "online":
                     turret["last_fire_result"] = (
                         "Streamer.bot is back online. Foam Cannon remains disabled until manually re-armed."
+                    )
+                    log_event(
+                        turret,
+                        "streamerbot_online",
+                        "Streamer.bot is back online. Cannon remains disabled until manually re-armed.",
+                        "success",
                     )
 
             if message.get("type") == "heartbeat":
