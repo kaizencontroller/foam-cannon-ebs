@@ -1,0 +1,1160 @@
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+from pathlib import Path
+import asyncio
+import random
+import time
+import uuid
+
+app = FastAPI()
+
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Tighten later for production.
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+DEFAULT_CHANNEL_ID = "local_test"
+DEFAULT_TURRET_ID = "main"
+
+MODE_LIVE_FIRE = "live_fire"
+MODE_QUEUE_ONLY = "queue_only"
+MODE_DISABLED = "disabled"
+
+channels = {
+    DEFAULT_CHANNEL_ID: {
+        "turrets": {
+            DEFAULT_TURRET_ID: {
+                "display_name": "Kaizen Foam Cannon",
+                "gun_type": "Swarmfire",
+                "magazine_capacity": 20,
+
+                # Physical darts assumed loaded.
+                "available_shots": 20,
+
+                # Reserved for later firing.
+                "queued_shots": 0,
+
+                # Currently being processed/fired.
+                "pending_shots": 0,
+
+                "enabled": True,
+                "operation_mode": MODE_LIVE_FIRE,
+
+                # Queue behavior
+                "auto_fire_queue": True,
+                "allow_overqueue": False,
+                "max_queue_size": 20,
+
+                # Random queue release behavior
+                "random_queue_release": False,
+                "random_min_seconds": 0,
+                "random_max_seconds": 30,
+                "random_burst_enabled": False,
+                "random_burst_min": 1,
+                "random_burst_max": 3,
+                "random_fixed_batch_size": 1,
+                "random_release_next_at": None,
+
+                "is_busy": False,
+                "cooldown_seconds": 0.75,
+                "max_shots_per_redeem": 10,
+                "streamerbot_action": "Nerf Turret",
+
+                "connection_status": "offline",
+                "streamerbot_status": "unknown",
+                "streamerbot_detail": "No Streamer.bot health check yet.",
+
+                "last_seen": None,
+                "last_fire_result": "No shots fired yet.",
+                "pending_commands": {},
+            }
+        }
+    }
+}
+
+control_connections = {}
+random_release_tasks = {}
+
+
+class ShotRequest(BaseModel):
+    channel_id: str = DEFAULT_CHANNEL_ID
+    turret_id: str = DEFAULT_TURRET_ID
+    count: int
+
+
+class ReloadRequest(BaseModel):
+    channel_id: str = DEFAULT_CHANNEL_ID
+    turret_id: str = DEFAULT_TURRET_ID
+    capacity: int = 20
+
+
+class TurretActionRequest(BaseModel):
+    channel_id: str = DEFAULT_CHANNEL_ID
+    turret_id: str = DEFAULT_TURRET_ID
+
+
+class ModeRequest(BaseModel):
+    channel_id: str = DEFAULT_CHANNEL_ID
+    turret_id: str = DEFAULT_TURRET_ID
+    operation_mode: str
+
+
+class FireQueueRequest(BaseModel):
+    channel_id: str = DEFAULT_CHANNEL_ID
+    turret_id: str = DEFAULT_TURRET_ID
+    count: int | None = None
+
+
+class AutoFireQueueRequest(BaseModel):
+    channel_id: str = DEFAULT_CHANNEL_ID
+    turret_id: str = DEFAULT_TURRET_ID
+    auto_fire_queue: bool
+
+
+class QueueSettingsRequest(BaseModel):
+    channel_id: str = DEFAULT_CHANNEL_ID
+    turret_id: str = DEFAULT_TURRET_ID
+    allow_overqueue: bool
+    max_queue_size: int
+    random_queue_release: bool
+    random_min_seconds: float = 0
+    random_max_seconds: float = 30
+    random_burst_enabled: bool = False
+    random_burst_min: int = 1
+    random_burst_max: int = 3
+    random_fixed_batch_size: int = 1
+
+
+def get_turret(channel_id: str, turret_id: str):
+    if channel_id not in channels:
+        raise KeyError(f"Unknown channel_id: {channel_id}")
+
+    turrets = channels[channel_id].get("turrets", {})
+
+    if turret_id not in turrets:
+        raise KeyError(f"Unknown turret_id: {turret_id}")
+
+    return turrets[turret_id]
+
+
+def get_connection_key(channel_id: str, turret_id: str):
+    return f"{channel_id}:{turret_id}"
+
+
+def get_unreserved_shots(turret):
+    """
+    Physical darts not already queued or pending.
+    This matters when overqueue is OFF.
+    """
+    return max(
+        0,
+        turret["available_shots"] - turret["queued_shots"] - turret["pending_shots"]
+    )
+
+
+def get_physical_fireable_shots(turret):
+    """
+    Physical darts available to fire right now.
+    Queued shots are allowed to become pending, so queued_shots are not subtracted here.
+    """
+    return max(0, turret["available_shots"] - turret["pending_shots"])
+
+
+def get_queue_capacity_remaining(turret):
+    if turret["allow_overqueue"]:
+        return max(0, turret["max_queue_size"] - turret["queued_shots"])
+
+    return get_unreserved_shots(turret)
+
+
+def is_enabled(turret):
+    return turret["operation_mode"] != MODE_DISABLED
+
+
+def local_system_ready(turret):
+    return (
+        turret["connection_status"] == "online"
+        and turret["streamerbot_status"] == "online"
+    )
+
+
+def auto_disable_turret(turret, reason: str):
+    turret["operation_mode"] = MODE_DISABLED
+    turret["enabled"] = False
+    turret["is_busy"] = False
+    turret["pending_shots"] = 0
+    turret["pending_commands"] = {}
+    turret["random_release_next_at"] = None
+    turret["last_fire_result"] = reason
+
+
+def get_can_fire_now(turret):
+    return (
+        turret["operation_mode"] == MODE_LIVE_FIRE
+        and local_system_ready(turret)
+        and not turret["is_busy"]
+        and get_physical_fireable_shots(turret) > 0
+    )
+
+
+def get_can_queue(turret):
+    return (
+        turret["operation_mode"] in {MODE_LIVE_FIRE, MODE_QUEUE_ONLY}
+        and local_system_ready(turret)
+        and get_queue_capacity_remaining(turret) > 0
+    )
+
+
+def get_viewer_action_label(turret):
+    if turret["operation_mode"] == MODE_LIVE_FIRE and not turret["is_busy"]:
+        return "Fire"
+
+    if turret["operation_mode"] in {MODE_LIVE_FIRE, MODE_QUEUE_ONLY}:
+        return "Queue"
+
+    return "Unavailable"
+
+
+def get_viewer_message(turret):
+    if turret["connection_status"] != "online":
+        return "Local control client is offline. Fire buttons blocked."
+
+    if turret["streamerbot_status"] != "online":
+        return f"Streamer.bot is offline. {turret['streamerbot_detail']}"
+
+    if turret["operation_mode"] == MODE_DISABLED:
+        return "Foam Cannon is disabled."
+
+    if turret["operation_mode"] == MODE_QUEUE_ONLY:
+        if turret["allow_overqueue"]:
+            return "Queue Mode Active. Queue may exceed loaded darts and require reloads."
+        return "Queue Mode Active. Shots will fire when the streamer releases the queue."
+
+    if turret["operation_mode"] == MODE_LIVE_FIRE and turret["is_busy"]:
+        return "Cannon is firing. New requests will be queued."
+
+    if get_queue_capacity_remaining(turret) <= 0:
+        return "Foam Cannon has no queue capacity available."
+
+    return turret["last_fire_result"] or "Ready."
+
+
+def reserve_for_fire(turret, count: int, source: str):
+    if source == "live_fire":
+        if count > get_physical_fireable_shots(turret):
+            return False, "Not enough loaded shots available to fire."
+        turret["pending_shots"] += count
+        return True, None
+
+    if source == "queue":
+        if count > turret["queued_shots"]:
+            return False, "Not enough queued shots available."
+        if count > get_physical_fireable_shots(turret):
+            return False, "Not enough loaded shots available. Reload needed."
+        turret["queued_shots"] -= count
+        turret["pending_shots"] += count
+        return True, None
+
+    return False, f"Unknown fire source: {source}"
+
+
+def restore_failed_fire_reservation(turret, count: int, source: str):
+    turret["pending_shots"] = max(0, turret["pending_shots"] - count)
+
+    if source == "queue":
+        turret["queued_shots"] += count
+
+
+def add_to_queue(turret, count: int, source_label: str):
+    if count <= 0:
+        return {"ok": False, "error": "Queue count must be greater than zero."}
+
+    if count > turret["max_shots_per_redeem"]:
+        return {
+            "ok": False,
+            "error": f"Maximum shots per request is {turret['max_shots_per_redeem']}.",
+        }
+
+    if count > get_queue_capacity_remaining(turret):
+        if turret["allow_overqueue"]:
+            return {"ok": False, "error": "Queue limit reached."}
+        return {"ok": False, "error": "Not enough unreserved loaded shots available to queue."}
+
+    turret["queued_shots"] += count
+    turret["last_fire_result"] = f"{source_label}: queued {count} shot(s)."
+
+    return {
+        "ok": True,
+        "message": f"Queued {count} shot(s).",
+        "available_shots": turret["available_shots"],
+        "queued_shots": turret["queued_shots"],
+        "pending_shots": turret["pending_shots"],
+        "unreserved_shots": get_unreserved_shots(turret),
+        "queue_capacity_remaining": get_queue_capacity_remaining(turret),
+    }
+
+
+async def send_fire_command(channel_id: str, turret_id: str, count: int, source: str):
+    turret = get_turret(channel_id, turret_id)
+    connection_key = get_connection_key(channel_id, turret_id)
+    websocket = control_connections.get(connection_key)
+
+    if websocket is None:
+        turret["connection_status"] = "offline"
+        auto_disable_turret(
+            turret,
+            "Auto-disabled because no active local control connection was found."
+        )
+        return {
+            "ok": False,
+            "error": "No active local control connection.",
+        }
+
+    if turret["streamerbot_status"] != "online":
+        auto_disable_turret(
+            turret,
+            f"Auto-disabled because Streamer.bot is offline. {turret['streamerbot_detail']}"
+        )
+        return {
+            "ok": False,
+            "error": f"Streamer.bot is offline. {turret['streamerbot_detail']}",
+        }
+
+    if turret["is_busy"]:
+        return {
+            "ok": False,
+            "error": "Turret is already processing another fire command.",
+        }
+
+    reserved_ok, reserve_error = reserve_for_fire(turret, count, source)
+
+    if not reserved_ok:
+        return {
+            "ok": False,
+            "error": reserve_error,
+        }
+
+    command_id = str(uuid.uuid4())
+
+    command = {
+        "type": "fire",
+        "command_id": command_id,
+        "channel_id": channel_id,
+        "turret_id": turret_id,
+        "shots": count,
+        "streamerbot_action": turret["streamerbot_action"],
+        "cooldown_seconds": turret["cooldown_seconds"],
+    }
+
+    try:
+        turret["is_busy"] = True
+        turret["random_release_next_at"] = None
+        turret["pending_commands"][command_id] = {
+            "source": source,
+            "count": count,
+            "created_at": time.time(),
+        }
+        turret["last_fire_result"] = f"Processing command {command_id} for {count} shot(s)."
+
+        await websocket.send_json(command)
+
+        return {
+            "ok": True,
+            "message": f"Sent {count} shot(s) to local control client.",
+            "command_id": command_id,
+            "available_shots": turret["available_shots"],
+            "queued_shots": turret["queued_shots"],
+            "pending_shots": turret["pending_shots"],
+            "unreserved_shots": get_unreserved_shots(turret),
+            "queue_capacity_remaining": get_queue_capacity_remaining(turret),
+            "is_busy": turret["is_busy"],
+        }
+
+    except Exception as error:
+        turret["pending_commands"].pop(command_id, None)
+        restore_failed_fire_reservation(turret, count, source)
+        turret["connection_status"] = "offline"
+        auto_disable_turret(
+            turret,
+            f"Auto-disabled because sending the fire command failed: {str(error)}"
+        )
+        return {
+            "ok": False,
+            "error": f"Failed to send fire command: {str(error)}",
+        }
+
+
+def get_random_burst_count(turret):
+    if turret["random_burst_enabled"]:
+        low = max(1, int(turret["random_burst_min"]))
+        high = max(low, int(turret["random_burst_max"]))
+        return random.randint(low, high)
+
+    return max(1, int(turret["random_fixed_batch_size"]))
+
+
+async def random_release_worker(channel_id: str, turret_id: str):
+    key = get_connection_key(channel_id, turret_id)
+
+    try:
+        turret = get_turret(channel_id, turret_id)
+
+        delay = random.uniform(
+            float(turret["random_min_seconds"]),
+            float(turret["random_max_seconds"]),
+        )
+
+        turret["random_release_next_at"] = time.time() + delay
+        turret["last_fire_result"] = f"Random queue release scheduled in {delay:.1f} second(s)."
+
+        await asyncio.sleep(delay)
+
+        turret = get_turret(channel_id, turret_id)
+
+        if not turret["random_queue_release"]:
+            turret["random_release_next_at"] = None
+            return
+
+        if turret["operation_mode"] != MODE_LIVE_FIRE:
+            turret["random_release_next_at"] = None
+            return
+
+        if not local_system_ready(turret):
+            turret["random_release_next_at"] = None
+            return
+
+        if turret["is_busy"]:
+            turret["random_release_next_at"] = None
+            schedule_random_release_if_needed(channel_id, turret_id)
+            return
+
+        if turret["queued_shots"] <= 0:
+            turret["random_release_next_at"] = None
+            return
+
+        physical_fireable = get_physical_fireable_shots(turret)
+
+        if physical_fireable <= 0:
+            turret["random_release_next_at"] = None
+            turret["last_fire_result"] = "Queued shots remain, but reload is needed before random release can continue."
+            return
+
+        requested_burst = get_random_burst_count(turret)
+
+        count_to_fire = min(
+            requested_burst,
+            turret["queued_shots"],
+            physical_fireable,
+            turret["max_shots_per_redeem"],
+        )
+
+        turret["random_release_next_at"] = None
+
+        if count_to_fire > 0:
+            await send_fire_command(
+                channel_id=channel_id,
+                turret_id=turret_id,
+                count=count_to_fire,
+                source="queue",
+            )
+
+    finally:
+        current_task = asyncio.current_task()
+        if random_release_tasks.get(key) == current_task:
+            del random_release_tasks[key]
+
+
+def schedule_random_release_if_needed(channel_id: str, turret_id: str):
+    key = get_connection_key(channel_id, turret_id)
+
+    if key in random_release_tasks and not random_release_tasks[key].done():
+        return
+
+    try:
+        turret = get_turret(channel_id, turret_id)
+    except KeyError:
+        return
+
+    if not turret["random_queue_release"]:
+        return
+
+    if turret["operation_mode"] != MODE_LIVE_FIRE:
+        return
+
+    if not local_system_ready(turret):
+        return
+
+    if turret["is_busy"]:
+        return
+
+    if turret["queued_shots"] <= 0:
+        return
+
+    if get_physical_fireable_shots(turret) <= 0:
+        return
+
+    random_release_tasks[key] = asyncio.create_task(
+        random_release_worker(channel_id, turret_id)
+    )
+
+
+async def start_next_queued_batch_if_allowed(channel_id: str, turret_id: str):
+    turret = get_turret(channel_id, turret_id)
+
+    if turret["queued_shots"] <= 0:
+        return
+
+    if turret["operation_mode"] != MODE_LIVE_FIRE:
+        return
+
+    if not local_system_ready(turret):
+        return
+
+    if turret["is_busy"]:
+        return
+
+    if turret["random_queue_release"]:
+        schedule_random_release_if_needed(channel_id, turret_id)
+        return
+
+    if not turret["auto_fire_queue"]:
+        return
+
+    physical_fireable = get_physical_fireable_shots(turret)
+
+    if physical_fireable <= 0:
+        turret["last_fire_result"] = "Queued shots remain, but reload is needed."
+        return
+
+    count_to_fire = min(
+        turret["queued_shots"],
+        turret["max_shots_per_redeem"],
+        physical_fireable,
+    )
+
+    if count_to_fire <= 0:
+        return
+
+    await send_fire_command(
+        channel_id=channel_id,
+        turret_id=turret_id,
+        count=count_to_fire,
+        source="queue",
+    )
+
+
+async def apply_fire_result(channel_id: str, turret_id: str, command_id: str, ok: bool, detail: str):
+    turret = get_turret(channel_id, turret_id)
+    pending = turret["pending_commands"].pop(command_id, None)
+    turret["is_busy"] = False
+
+    if pending is None:
+        turret["last_fire_result"] = (
+            f"Received result for unknown command {command_id}: "
+            f"{'OK' if ok else 'FAILED'} {detail}"
+        )
+        return
+
+    count = int(pending["count"])
+    source = pending["source"]
+
+    if ok:
+        turret["pending_shots"] = max(0, turret["pending_shots"] - count)
+        turret["available_shots"] = max(0, turret["available_shots"] - count)
+
+        turret["last_fire_result"] = (
+            f"Command {command_id} result: OK. "
+            f"{count} shot(s) confirmed accepted by Streamer.bot. {detail}"
+        )
+
+        await start_next_queued_batch_if_allowed(channel_id, turret_id)
+
+    else:
+        restore_failed_fire_reservation(turret, count, source)
+
+        auto_disable_turret(
+            turret,
+            (
+                f"Command {command_id} result: FAILED. "
+                f"No shots were deducted. Foam Cannon auto-disabled. {detail}"
+            )
+        )
+
+
+@app.get("/")
+def root():
+    return {
+        "ok": True,
+        "service": "Kaizen Foam Cannon EBS",
+        "panel": "/panel.html",
+        "config": "/config.html",
+        "status_endpoint": "/api/status",
+        "control_websocket": "/ws/control",
+    }
+
+
+@app.get("/panel.html")
+def serve_panel():
+    return FileResponse(STATIC_DIR / "panel.html")
+
+
+@app.get("/config.html")
+def serve_config():
+    return FileResponse(STATIC_DIR / "config.html")
+
+
+@app.get("/api/status")
+def status(
+    channel_id: str = DEFAULT_CHANNEL_ID,
+    turret_id: str = DEFAULT_TURRET_ID,
+):
+    try:
+        turret = get_turret(channel_id, turret_id)
+    except KeyError as error:
+        return {"ok": False, "error": str(error)}
+
+    turret["enabled"] = is_enabled(turret)
+
+    return {
+        "ok": True,
+        "channel_id": channel_id,
+        "turret_id": turret_id,
+        "display_name": turret["display_name"],
+        "gun_type": turret["gun_type"],
+        "magazine_capacity": turret["magazine_capacity"],
+        "available_shots": turret["available_shots"],
+        "queued_shots": turret["queued_shots"],
+        "pending_shots": turret["pending_shots"],
+        "unreserved_shots": get_unreserved_shots(turret),
+        "queue_capacity_remaining": get_queue_capacity_remaining(turret),
+        "enabled": turret["enabled"],
+        "operation_mode": turret["operation_mode"],
+        "auto_fire_queue": turret["auto_fire_queue"],
+        "allow_overqueue": turret["allow_overqueue"],
+        "max_queue_size": turret["max_queue_size"],
+        "random_queue_release": turret["random_queue_release"],
+        "random_min_seconds": turret["random_min_seconds"],
+        "random_max_seconds": turret["random_max_seconds"],
+        "random_burst_enabled": turret["random_burst_enabled"],
+        "random_burst_min": turret["random_burst_min"],
+        "random_burst_max": turret["random_burst_max"],
+        "random_fixed_batch_size": turret["random_fixed_batch_size"],
+        "random_release_next_at": turret["random_release_next_at"],
+        "is_busy": turret["is_busy"],
+        "cooldown_seconds": turret["cooldown_seconds"],
+        "max_shots_per_redeem": turret["max_shots_per_redeem"],
+        "streamerbot_action": turret["streamerbot_action"],
+        "connection_status": turret["connection_status"],
+        "streamerbot_status": turret["streamerbot_status"],
+        "streamerbot_detail": turret["streamerbot_detail"],
+        "last_seen": turret["last_seen"],
+        "last_fire_result": turret["last_fire_result"],
+        "can_fire_now": get_can_fire_now(turret),
+        "can_queue": get_can_queue(turret),
+        "viewer_action_label": get_viewer_action_label(turret),
+        "viewer_message": get_viewer_message(turret),
+    }
+
+
+@app.post("/api/request-shots")
+async def request_shots(request: ShotRequest):
+    try:
+        turret = get_turret(request.channel_id, request.turret_id)
+    except KeyError as error:
+        return {"ok": False, "error": str(error)}
+
+    if request.count <= 0:
+        return {"ok": False, "error": "Shot count must be greater than zero."}
+
+    if request.count > turret["max_shots_per_redeem"]:
+        return {
+            "ok": False,
+            "error": f"Maximum shots per request is {turret['max_shots_per_redeem']}.",
+        }
+
+    if turret["connection_status"] != "online":
+        auto_disable_turret(
+            turret,
+            "Auto-disabled because the local control client is offline."
+        )
+        return {"ok": False, "error": "Local control client is offline."}
+
+    if turret["streamerbot_status"] != "online":
+        auto_disable_turret(
+            turret,
+            f"Auto-disabled because Streamer.bot is offline. {turret['streamerbot_detail']}"
+        )
+        return {"ok": False, "error": f"Streamer.bot is offline. {turret['streamerbot_detail']}"}
+
+    if turret["operation_mode"] == MODE_DISABLED:
+        return {"ok": False, "error": "Foam Cannon is disabled."}
+
+    # Live Fire + ready + enough physical shots = fire immediately.
+    if (
+        turret["operation_mode"] == MODE_LIVE_FIRE
+        and not turret["is_busy"]
+        and request.count <= get_physical_fireable_shots(turret)
+    ):
+        result = await send_fire_command(
+            channel_id=request.channel_id,
+            turret_id=request.turret_id,
+            count=request.count,
+            source="live_fire",
+        )
+        result["mode"] = MODE_LIVE_FIRE
+        return result
+
+    # Otherwise, queue it if queue capacity allows.
+    queue_result = add_to_queue(turret, request.count, "Viewer request")
+
+    if queue_result["ok"]:
+        if turret["operation_mode"] == MODE_LIVE_FIRE:
+            queue_result["message"] = f"Cannon is firing or not ready. Queued {request.count} shot(s)."
+            schedule_random_release_if_needed(request.channel_id, request.turret_id)
+
+        elif turret["operation_mode"] == MODE_QUEUE_ONLY:
+            queue_result["message"] = f"Queued {request.count} shot(s) for later."
+
+        queue_result["mode"] = turret["operation_mode"]
+
+    return queue_result
+
+
+@app.post("/api/fire")
+async def fire(request: ShotRequest):
+    return await request_shots(request)
+
+
+@app.post("/api/queue/add")
+async def queue_add(request: ShotRequest):
+    try:
+        turret = get_turret(request.channel_id, request.turret_id)
+    except KeyError as error:
+        return {"ok": False, "error": str(error)}
+
+    result = add_to_queue(turret, request.count, "Streamer manual add")
+
+    if result["ok"]:
+        schedule_random_release_if_needed(request.channel_id, request.turret_id)
+
+    return result
+
+
+@app.post("/api/reload")
+def reload(request: ReloadRequest):
+    try:
+        turret = get_turret(request.channel_id, request.turret_id)
+    except KeyError as error:
+        return {"ok": False, "error": str(error)}
+
+    if request.capacity <= 0:
+        return {"ok": False, "error": "Capacity must be greater than zero."}
+
+    if turret["is_busy"]:
+        return {
+            "ok": False,
+            "error": "Cannot reload while turret is processing a fire command.",
+        }
+
+    if not turret["allow_overqueue"]:
+        if request.capacity < turret["queued_shots"] + turret["pending_shots"]:
+            return {
+                "ok": False,
+                "error": (
+                    f"Reload capacity cannot be less than queued + pending shots. "
+                    f"Queued: {turret['queued_shots']}, pending: {turret['pending_shots']}, "
+                    f"requested capacity: {request.capacity}."
+                ),
+            }
+
+    turret["magazine_capacity"] = request.capacity
+    turret["available_shots"] = request.capacity
+    turret["last_fire_result"] = (
+        f"Reloaded to {request.capacity}. Queue preserved at {turret['queued_shots']} shot(s)."
+    )
+
+    return {
+        "ok": True,
+        "message": (
+            f"Reloaded to {request.capacity}. Queue preserved at {turret['queued_shots']} shot(s)."
+        ),
+        "available_shots": turret["available_shots"],
+        "queued_shots": turret["queued_shots"],
+        "pending_shots": turret["pending_shots"],
+        "unreserved_shots": get_unreserved_shots(turret),
+        "queue_capacity_remaining": get_queue_capacity_remaining(turret),
+        "magazine_capacity": turret["magazine_capacity"],
+    }
+
+
+@app.post("/api/mode")
+async def set_mode(request: ModeRequest):
+    try:
+        turret = get_turret(request.channel_id, request.turret_id)
+    except KeyError as error:
+        return {"ok": False, "error": str(error)}
+
+    valid_modes = {MODE_LIVE_FIRE, MODE_QUEUE_ONLY, MODE_DISABLED}
+
+    if request.operation_mode not in valid_modes:
+        return {
+            "ok": False,
+            "error": f"Invalid mode. Valid modes: {', '.join(sorted(valid_modes))}",
+        }
+
+    if request.operation_mode in {MODE_LIVE_FIRE, MODE_QUEUE_ONLY} and not local_system_ready(turret):
+        return {
+            "ok": False,
+            "error": "Cannot arm Foam Cannon while local control or Streamer.bot is offline.",
+        }
+
+    turret["operation_mode"] = request.operation_mode
+    turret["enabled"] = is_enabled(turret)
+    turret["last_fire_result"] = f"Mode changed to {request.operation_mode}."
+
+    if request.operation_mode == MODE_LIVE_FIRE:
+        await start_next_queued_batch_if_allowed(request.channel_id, request.turret_id)
+
+    return {
+        "ok": True,
+        "message": f"Mode changed to {request.operation_mode}.",
+        "operation_mode": turret["operation_mode"],
+    }
+
+
+@app.post("/api/settings/queue")
+async def set_queue_settings(request: QueueSettingsRequest):
+    try:
+        turret = get_turret(request.channel_id, request.turret_id)
+    except KeyError as error:
+        return {"ok": False, "error": str(error)}
+
+    if request.max_queue_size < 0:
+        return {"ok": False, "error": "Max queue size cannot be negative."}
+
+    if request.max_queue_size < turret["queued_shots"]:
+        return {
+            "ok": False,
+            "error": f"Max queue size cannot be less than current queued shots: {turret['queued_shots']}.",
+        }
+
+    if request.random_min_seconds < 0 or request.random_max_seconds < 0:
+        return {"ok": False, "error": "Random delay cannot be negative."}
+
+    if request.random_max_seconds < request.random_min_seconds:
+        return {"ok": False, "error": "Random max delay must be greater than or equal to min delay."}
+
+    if request.random_burst_min <= 0 or request.random_burst_max <= 0:
+        return {"ok": False, "error": "Random burst values must be greater than zero."}
+
+    if request.random_burst_max < request.random_burst_min:
+        return {"ok": False, "error": "Random burst max must be greater than or equal to min."}
+
+    turret["allow_overqueue"] = request.allow_overqueue
+    turret["max_queue_size"] = request.max_queue_size
+    turret["random_queue_release"] = request.random_queue_release
+    turret["random_min_seconds"] = request.random_min_seconds
+    turret["random_max_seconds"] = request.random_max_seconds
+    turret["random_burst_enabled"] = request.random_burst_enabled
+    turret["random_burst_min"] = request.random_burst_min
+    turret["random_burst_max"] = request.random_burst_max
+    turret["random_fixed_batch_size"] = max(1, request.random_fixed_batch_size)
+
+    turret["last_fire_result"] = "Queue settings updated."
+
+    schedule_random_release_if_needed(request.channel_id, request.turret_id)
+
+    return {
+        "ok": True,
+        "message": "Queue settings updated.",
+        "allow_overqueue": turret["allow_overqueue"],
+        "max_queue_size": turret["max_queue_size"],
+        "random_queue_release": turret["random_queue_release"],
+        "random_burst_enabled": turret["random_burst_enabled"],
+    }
+
+
+@app.post("/api/auto-fire-queue")
+async def set_auto_fire_queue(request: AutoFireQueueRequest):
+    try:
+        turret = get_turret(request.channel_id, request.turret_id)
+    except KeyError as error:
+        return {"ok": False, "error": str(error)}
+
+    turret["auto_fire_queue"] = request.auto_fire_queue
+    turret["last_fire_result"] = (
+        f"Auto-fire queue set to {'ON' if turret['auto_fire_queue'] else 'OFF'}."
+    )
+
+    await start_next_queued_batch_if_allowed(request.channel_id, request.turret_id)
+
+    return {
+        "ok": True,
+        "message": turret["last_fire_result"],
+        "auto_fire_queue": turret["auto_fire_queue"],
+    }
+
+
+@app.post("/api/enable")
+async def enable(request: TurretActionRequest):
+    return await set_mode(ModeRequest(
+        channel_id=request.channel_id,
+        turret_id=request.turret_id,
+        operation_mode=MODE_LIVE_FIRE,
+    ))
+
+
+@app.post("/api/disable")
+async def disable(request: TurretActionRequest):
+    return await set_mode(ModeRequest(
+        channel_id=request.channel_id,
+        turret_id=request.turret_id,
+        operation_mode=MODE_DISABLED,
+    ))
+
+
+@app.post("/api/open-queue")
+async def open_queue(request: TurretActionRequest):
+    return await set_mode(ModeRequest(
+        channel_id=request.channel_id,
+        turret_id=request.turret_id,
+        operation_mode=MODE_QUEUE_ONLY,
+    ))
+
+
+@app.post("/api/set-empty")
+def set_empty(request: TurretActionRequest):
+    try:
+        turret = get_turret(request.channel_id, request.turret_id)
+    except KeyError as error:
+        return {"ok": False, "error": str(error)}
+
+    if turret["is_busy"]:
+        return {
+            "ok": False,
+            "error": "Cannot set empty while turret is processing a fire command.",
+        }
+
+    turret["available_shots"] = 0
+    turret["queued_shots"] = 0
+    turret["pending_shots"] = 0
+    turret["pending_commands"] = {}
+    turret["random_release_next_at"] = None
+    turret["last_fire_result"] = "Shot count set to empty. Queue cleared."
+
+    return {
+        "ok": True,
+        "message": "Shot count set to empty. Queue cleared.",
+        "available_shots": turret["available_shots"],
+        "queued_shots": turret["queued_shots"],
+        "pending_shots": turret["pending_shots"],
+    }
+
+
+@app.post("/api/queue/clear")
+def clear_queue(request: TurretActionRequest):
+    try:
+        turret = get_turret(request.channel_id, request.turret_id)
+    except KeyError as error:
+        return {"ok": False, "error": str(error)}
+
+    if turret["is_busy"]:
+        return {
+            "ok": False,
+            "error": "Cannot clear queue while turret is firing.",
+        }
+
+    turret["queued_shots"] = 0
+    turret["random_release_next_at"] = None
+    turret["last_fire_result"] = "Queue cleared."
+
+    return {
+        "ok": True,
+        "message": "Queue cleared.",
+        "queued_shots": turret["queued_shots"],
+        "pending_shots": turret["pending_shots"],
+        "unreserved_shots": get_unreserved_shots(turret),
+        "queue_capacity_remaining": get_queue_capacity_remaining(turret),
+    }
+
+
+@app.post("/api/queue/fire")
+async def fire_queue(request: FireQueueRequest):
+    try:
+        turret = get_turret(request.channel_id, request.turret_id)
+    except KeyError as error:
+        return {"ok": False, "error": str(error)}
+
+    if not local_system_ready(turret):
+        auto_disable_turret(
+            turret,
+            "Auto-disabled because local control or Streamer.bot is offline."
+        )
+        return {"ok": False, "error": "Local control or Streamer.bot is offline."}
+
+    if turret["operation_mode"] == MODE_DISABLED:
+        return {"ok": False, "error": "Foam Cannon is disabled."}
+
+    if turret["is_busy"]:
+        return {
+            "ok": False,
+            "error": "Turret is currently processing another fire command.",
+        }
+
+    if turret["queued_shots"] <= 0:
+        return {"ok": False, "error": "Queue is empty."}
+
+    physical_fireable = get_physical_fireable_shots(turret)
+
+    if physical_fireable <= 0:
+        return {"ok": False, "error": "No loaded shots available. Reload needed."}
+
+    count_to_fire = turret["queued_shots"] if request.count is None else int(request.count)
+
+    if count_to_fire <= 0:
+        return {"ok": False, "error": "Queue fire count must be greater than zero."}
+
+    count_to_fire = min(
+        count_to_fire,
+        turret["queued_shots"],
+        turret["max_shots_per_redeem"],
+        physical_fireable,
+    )
+
+    result = await send_fire_command(
+        channel_id=request.channel_id,
+        turret_id=request.turret_id,
+        count=count_to_fire,
+        source="queue",
+    )
+
+    return result
+
+
+@app.websocket("/ws/control")
+async def control_socket(websocket: WebSocket):
+    await websocket.accept()
+
+    channel_id = None
+    turret_id = None
+    connection_key = None
+
+    try:
+        hello = await websocket.receive_json()
+
+        if hello.get("type") != "hello":
+            await websocket.send_json({
+                "type": "error",
+                "error": "Expected hello message.",
+            })
+            await websocket.close()
+            return
+
+        channel_id = hello.get("channel_id", DEFAULT_CHANNEL_ID)
+        turret_id = hello.get("turret_id", DEFAULT_TURRET_ID)
+
+        try:
+            turret = get_turret(channel_id, turret_id)
+        except KeyError as error:
+            await websocket.send_json({
+                "type": "error",
+                "error": str(error),
+            })
+            await websocket.close()
+            return
+
+        connection_key = get_connection_key(channel_id, turret_id)
+        control_connections[connection_key] = websocket
+
+        turret["connection_status"] = "online"
+        turret["streamerbot_status"] = hello.get("streamerbot_status", "unknown")
+        turret["streamerbot_detail"] = hello.get("streamerbot_detail", "No Streamer.bot detail supplied.")
+        turret["last_seen"] = time.time()
+        turret["last_fire_result"] = "Local control client connected."
+
+        if turret["streamerbot_status"] != "online":
+            auto_disable_turret(
+                turret,
+                f"Auto-disabled because Streamer.bot is offline. {turret['streamerbot_detail']}"
+            )
+
+        await websocket.send_json({
+            "type": "hello_ack",
+            "message": "Local control client connected.",
+            "channel_id": channel_id,
+            "turret_id": turret_id,
+        })
+
+        while True:
+            message = await websocket.receive_json()
+            turret["last_seen"] = time.time()
+
+            if message.get("streamerbot_status"):
+                previous_streamerbot_status = turret["streamerbot_status"]
+
+                turret["streamerbot_status"] = message.get("streamerbot_status")
+                turret["streamerbot_detail"] = message.get("streamerbot_detail", "")
+
+                if turret["streamerbot_status"] != "online":
+                    auto_disable_turret(
+                        turret,
+                        f"Auto-disabled because Streamer.bot is offline. {turret['streamerbot_detail']}"
+                    )
+
+                elif previous_streamerbot_status != "online":
+                    turret["last_fire_result"] = (
+                        "Streamer.bot is back online. Foam Cannon remains disabled until manually re-armed."
+                    )
+
+            if message.get("type") == "heartbeat":
+                await websocket.send_json({
+                    "type": "heartbeat_ack",
+                    "time": time.time(),
+                })
+
+            elif message.get("type") == "fire_result":
+                ok = message.get("ok", False)
+                command_id = message.get("command_id")
+                detail = message.get("detail", "")
+
+                await apply_fire_result(
+                    channel_id=channel_id,
+                    turret_id=turret_id,
+                    command_id=command_id,
+                    ok=ok,
+                    detail=detail,
+                )
+
+            else:
+                await websocket.send_json({
+                    "type": "warning",
+                    "message": f"Unknown message type: {message.get('type')}",
+                })
+
+    except WebSocketDisconnect:
+        pass
+
+    finally:
+        if connection_key and control_connections.get(connection_key) == websocket:
+            del control_connections[connection_key]
+
+        if channel_id and turret_id:
+            try:
+                turret = get_turret(channel_id, turret_id)
+                turret["connection_status"] = "offline"
+                turret["streamerbot_status"] = "unknown"
+                turret["streamerbot_detail"] = "Local control client disconnected."
+                auto_disable_turret(
+                    turret,
+                    "Auto-disabled because local control client disconnected."
+                )
+            except KeyError:
+                pass

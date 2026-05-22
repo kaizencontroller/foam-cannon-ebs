@@ -1,0 +1,470 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Kaizen Foam Cannon Config</title>
+
+  <script src="https://extension-files.twitch.tv/helper/v1/twitch-ext.min.js"></script>
+
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #18181b;
+      color: white;
+      padding: 16px;
+      margin: 0;
+    }
+
+    .card {
+      border: 1px solid #444;
+      border-radius: 12px;
+      padding: 16px;
+      background: #24242a;
+    }
+
+    h1 {
+      font-size: 20px;
+      margin-top: 0;
+    }
+
+    h2 {
+      font-size: 16px;
+      margin-top: 18px;
+      margin-bottom: 8px;
+    }
+
+    .status {
+      margin: 8px 0;
+      font-size: 15px;
+    }
+
+    button {
+      margin: 4px;
+      padding: 10px 14px;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: bold;
+    }
+
+    input {
+      padding: 8px;
+      width: 80px;
+      margin: 4px;
+      border-radius: 6px;
+      border: none;
+    }
+
+    input[type="checkbox"] {
+      width: auto;
+    }
+
+    label {
+      display: block;
+      margin: 8px 0;
+    }
+
+    .danger {
+      background: #a83232;
+      color: white;
+    }
+
+    .queue {
+      background: #f5c542;
+      color: #18181b;
+    }
+
+    .small {
+      font-size: 12px;
+      opacity: 0.75;
+      margin-top: 12px;
+      line-height: 1.4;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="card">
+    <h1>Kaizen Foam Cannon Streamer Controls</h1>
+
+    <div class="status">Loaded Shots: <strong id="shots">?</strong></div>
+    <div class="status">Firing Now: <strong id="pending">?</strong></div>
+    <div class="status">Queued Shots: <strong id="queued">?</strong></div>
+    <div class="status">Unreserved Loaded: <strong id="unreserved">?</strong></div>
+    <div class="status">Queue Capacity Remaining: <strong id="queueCapacityRemaining">?</strong></div>
+    <div class="status">Capacity: <strong id="capacityDisplay">?</strong></div>
+    <div class="status">Mode: <strong id="mode">Loading...</strong></div>
+    <div class="status">Local Control: <strong id="connection">Checking...</strong></div>
+    <div class="status">Streamer.bot: <strong id="streamerbot">Checking...</strong></div>
+    <div class="status">Command State: <strong id="busy">Checking...</strong></div>
+    <div class="status">Random Queue Next Release: <strong id="randomNext">?</strong></div>
+
+    <h2>Load / Mode</h2>
+
+    <label>
+      Reload Capacity:
+      <input id="capacity" type="number" min="1" max="100" value="20" />
+    </label>
+
+    <div>
+      <button id="reload">Reload</button>
+      <button id="liveFire">Live Fire</button>
+      <button id="openQueue" class="queue">Open Queue</button>
+      <button id="disable" class="danger">Disable</button>
+      <button id="empty">Set Empty</button>
+    </div>
+
+    <h2>Manual Queue Controls</h2>
+
+    <div>
+      <button id="addQueue1">Add Queue 1</button>
+      <button id="addQueue3">Add Queue 3</button>
+      <button id="addQueue5">Add Queue 5</button>
+      <button id="addQueue10">Add Queue 10</button>
+    </div>
+
+    <div>
+      <button id="fireNext1">Fire Queued 1</button>
+      <button id="fireNext3">Fire Queued 3</button>
+      <button id="fireAll">Fire All Queued</button>
+      <button id="clearQueue">Clear Queue</button>
+    </div>
+
+    <h2>Queue Settings</h2>
+
+    <label>
+      <input id="allowOverqueue" type="checkbox" />
+      Allow Queue Beyond Loaded Darts
+    </label>
+
+    <label>
+      Max Queue Size:
+      <input id="maxQueueSize" type="number" min="0" max="500" value="20" />
+    </label>
+
+    <label>
+      <input id="autoFireQueue" type="checkbox" />
+      Auto-Fire Queue in Live Fire Mode
+    </label>
+
+    <label>
+      <input id="randomQueueRelease" type="checkbox" />
+      Random Queue Release
+    </label>
+
+    <label>
+      Random Min Delay:
+      <input id="randomMinSeconds" type="number" min="0" max="300" value="0" />
+      sec
+    </label>
+
+    <label>
+      Random Max Delay:
+      <input id="randomMaxSeconds" type="number" min="0" max="300" value="30" />
+      sec
+    </label>
+
+    <label>
+      <input id="randomBurstEnabled" type="checkbox" />
+      Random Burst Size
+    </label>
+
+    <label>
+      Random Burst Min:
+      <input id="randomBurstMin" type="number" min="1" max="10" value="1" />
+    </label>
+
+    <label>
+      Random Burst Max:
+      <input id="randomBurstMax" type="number" min="1" max="10" value="3" />
+    </label>
+
+    <label>
+      Fixed Random Release Batch Size:
+      <input id="randomFixedBatchSize" type="number" min="1" max="10" value="1" />
+    </label>
+
+    <button id="saveQueueSettings">Save Queue Settings</button>
+
+    <p id="message">Loading backend status...</p>
+    <p class="small" id="debug">Waiting for Twitch authorization...</p>
+  </div>
+
+  <script>
+    const EBS_BASE_URL = window.location.origin;
+
+    const CHANNEL_ID = "local_test";
+    const TURRET_ID = "main";
+
+    let twitchAuth = null;
+    let isRefreshing = false;
+
+    async function apiGet(path) {
+      const response = await fetch(EBS_BASE_URL + path);
+      return await response.json();
+    }
+
+    async function apiPost(path, payload) {
+      const response = await fetch(EBS_BASE_URL + path, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": twitchAuth ? "Bearer " + twitchAuth.token : ""
+        },
+        body: JSON.stringify(payload || {})
+      });
+
+      return await response.json();
+    }
+
+    function formatMode(mode) {
+      if (mode === "live_fire") return "Live Fire";
+      if (mode === "queue_only") return "Open Queue";
+      if (mode === "disabled") return "Disabled";
+      return mode;
+    }
+
+    function formatRandomNext(timestamp) {
+      if (!timestamp) return "Not scheduled";
+
+      const seconds = Math.max(0, Math.round(timestamp - (Date.now() / 1000)));
+
+      if (seconds <= 0) return "Due now";
+      return `${seconds} sec`;
+    }
+
+    function basePayload() {
+      return {
+        channel_id: CHANNEL_ID,
+        turret_id: TURRET_ID
+      };
+    }
+
+    function numberValue(id, fallback) {
+      const value = parseFloat(document.getElementById(id).value);
+      return Number.isFinite(value) ? value : fallback;
+    }
+
+    function intValue(id, fallback) {
+      const value = parseInt(document.getElementById(id).value, 10);
+      return Number.isFinite(value) ? value : fallback;
+    }
+
+    function getQueueSettingsPayload() {
+      return {
+        ...basePayload(),
+        allow_overqueue: document.getElementById("allowOverqueue").checked,
+        max_queue_size: intValue("maxQueueSize", 20),
+        random_queue_release: document.getElementById("randomQueueRelease").checked,
+        random_min_seconds: numberValue("randomMinSeconds", 0),
+        random_max_seconds: numberValue("randomMaxSeconds", 30),
+        random_burst_enabled: document.getElementById("randomBurstEnabled").checked,
+        random_burst_min: intValue("randomBurstMin", 1),
+        random_burst_max: intValue("randomBurstMax", 3),
+        random_fixed_batch_size: intValue("randomFixedBatchSize", 1)
+      };
+    }
+
+    async function doAction(path, payload) {
+      try {
+        const data = await apiPost(path, payload || {});
+        document.getElementById("message").textContent =
+          data.message || data.error || "Action complete.";
+        await refreshStatus();
+
+      } catch (error) {
+        document.getElementById("message").textContent = "Action failed.";
+        await refreshStatus();
+      }
+    }
+
+    async function saveQueueSettings() {
+      await doAction("/api/settings/queue", getQueueSettingsPayload());
+    }
+
+    async function refreshStatus() {
+      if (isRefreshing) return;
+
+      isRefreshing = true;
+
+      try {
+        const data = await apiGet(`/api/status?channel_id=${CHANNEL_ID}&turret_id=${TURRET_ID}`);
+
+        if (!data.ok) {
+          throw new Error(data.error || "Backend status error.");
+        }
+
+        document.getElementById("shots").textContent = data.available_shots;
+        document.getElementById("pending").textContent = data.pending_shots;
+        document.getElementById("queued").textContent = data.queued_shots;
+        document.getElementById("unreserved").textContent = data.unreserved_shots;
+        document.getElementById("queueCapacityRemaining").textContent = data.queue_capacity_remaining;
+        document.getElementById("capacityDisplay").textContent = data.magazine_capacity;
+        document.getElementById("capacity").value = data.magazine_capacity;
+        document.getElementById("mode").textContent = formatMode(data.operation_mode);
+        document.getElementById("connection").textContent =
+          data.connection_status === "online" ? "Online" : "Offline";
+        document.getElementById("streamerbot").textContent =
+          data.streamerbot_status === "online" ? "Online" : "Offline";
+        document.getElementById("busy").textContent = data.is_busy ? "Firing..." : "Ready";
+        document.getElementById("randomNext").textContent =
+          formatRandomNext(data.random_release_next_at);
+
+        document.getElementById("allowOverqueue").checked = data.allow_overqueue;
+        document.getElementById("maxQueueSize").value = data.max_queue_size;
+        document.getElementById("autoFireQueue").checked = data.auto_fire_queue;
+        document.getElementById("randomQueueRelease").checked = data.random_queue_release;
+        document.getElementById("randomMinSeconds").value = data.random_min_seconds;
+        document.getElementById("randomMaxSeconds").value = data.random_max_seconds;
+        document.getElementById("randomBurstEnabled").checked = data.random_burst_enabled;
+        document.getElementById("randomBurstMin").value = data.random_burst_min;
+        document.getElementById("randomBurstMax").value = data.random_burst_max;
+        document.getElementById("randomFixedBatchSize").value = data.random_fixed_batch_size;
+
+        document.getElementById("message").textContent =
+          data.viewer_message || data.last_fire_result || "Backend connected.";
+
+      } catch (error) {
+        document.getElementById("mode").textContent = "Backend Offline";
+        document.getElementById("connection").textContent = "Unknown";
+        document.getElementById("streamerbot").textContent = "Unknown";
+        document.getElementById("busy").textContent = "Unknown";
+        document.getElementById("message").textContent = "Could not reach EBS.";
+      } finally {
+        isRefreshing = false;
+      }
+    }
+
+    document.getElementById("reload").addEventListener("click", () => {
+      const capacity = intValue("capacity", 20);
+      doAction("/api/reload", {
+        ...basePayload(),
+        capacity: capacity
+      });
+    });
+
+    document.getElementById("liveFire").addEventListener("click", () => {
+      doAction("/api/mode", {
+        ...basePayload(),
+        operation_mode: "live_fire"
+      });
+    });
+
+    document.getElementById("openQueue").addEventListener("click", () => {
+      doAction("/api/mode", {
+        ...basePayload(),
+        operation_mode: "queue_only"
+      });
+    });
+
+    document.getElementById("disable").addEventListener("click", () => {
+      doAction("/api/mode", {
+        ...basePayload(),
+        operation_mode: "disabled"
+      });
+    });
+
+    document.getElementById("empty").addEventListener("click", () => {
+      doAction("/api/set-empty", basePayload());
+    });
+
+    document.getElementById("addQueue1").addEventListener("click", () => {
+      doAction("/api/queue/add", { ...basePayload(), count: 1 });
+    });
+
+    document.getElementById("addQueue3").addEventListener("click", () => {
+      doAction("/api/queue/add", { ...basePayload(), count: 3 });
+    });
+
+    document.getElementById("addQueue5").addEventListener("click", () => {
+      doAction("/api/queue/add", { ...basePayload(), count: 5 });
+    });
+
+    document.getElementById("addQueue10").addEventListener("click", () => {
+      doAction("/api/queue/add", { ...basePayload(), count: 10 });
+    });
+
+    document.getElementById("fireNext1").addEventListener("click", () => {
+      doAction("/api/queue/fire", {
+        ...basePayload(),
+        count: 1
+      });
+    });
+
+    document.getElementById("fireNext3").addEventListener("click", () => {
+      doAction("/api/queue/fire", {
+        ...basePayload(),
+        count: 3
+      });
+    });
+
+    document.getElementById("fireAll").addEventListener("click", () => {
+      doAction("/api/queue/fire", {
+        ...basePayload()
+      });
+    });
+
+    document.getElementById("clearQueue").addEventListener("click", () => {
+      doAction("/api/queue/clear", basePayload());
+    });
+
+    document.getElementById("saveQueueSettings").addEventListener("click", () => {
+      saveQueueSettings();
+    });
+
+    document.getElementById("autoFireQueue").addEventListener("change", () => {
+      doAction("/api/auto-fire-queue", {
+        ...basePayload(),
+        auto_fire_queue: document.getElementById("autoFireQueue").checked
+      });
+    });
+
+    [
+      "allowOverqueue",
+      "randomQueueRelease",
+      "randomBurstEnabled"
+    ].forEach((id) => {
+      document.getElementById(id).addEventListener("change", () => {
+        saveQueueSettings();
+      });
+    });
+
+    [
+      "maxQueueSize",
+      "randomMinSeconds",
+      "randomMaxSeconds",
+      "randomBurstMin",
+      "randomBurstMax",
+      "randomFixedBatchSize"
+    ].forEach((id) => {
+      document.getElementById(id).addEventListener("change", () => {
+        saveQueueSettings();
+      });
+    });
+
+    if (window.Twitch && window.Twitch.ext) {
+      window.Twitch.ext.onAuthorized(function(auth) {
+        twitchAuth = auth;
+
+        document.getElementById("debug").textContent =
+          "Authorized | Channel ID: " + auth.channelId +
+          " | Client ID: " + auth.clientId;
+
+        refreshStatus();
+      });
+
+      window.Twitch.ext.onError(function(error) {
+        console.error("Twitch extension error:", error);
+        document.getElementById("debug").textContent = "Twitch helper error.";
+      });
+    } else {
+      document.getElementById("debug").textContent =
+        "Twitch helper not available. Direct browser test mode.";
+      refreshStatus();
+    }
+
+    setInterval(refreshStatus, 1000);
+    refreshStatus();
+  </script>
+</body>
+</html>
