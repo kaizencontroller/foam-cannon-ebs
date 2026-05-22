@@ -47,9 +47,9 @@
       font-weight: bold;
     }
 
-    input {
+    input, select {
       padding: 8px;
-      width: 80px;
+      width: 160px;
       margin: 4px;
       border-radius: 6px;
       border: none;
@@ -94,6 +94,8 @@
     <div class="status">Queue Capacity Remaining: <strong id="queueCapacityRemaining">?</strong></div>
     <div class="status">Capacity: <strong id="capacityDisplay">?</strong></div>
     <div class="status">Mode: <strong id="mode">Loading...</strong></div>
+    <div class="status">Payment Mode: <strong id="paymentModeDisplay">Loading...</strong></div>
+    <div class="status">JWT Enforcement: <strong id="jwtEnforcement">?</strong></div>
     <div class="status">Local Control: <strong id="connection">Checking...</strong></div>
     <div class="status">Streamer.bot: <strong id="streamerbot">Checking...</strong></div>
     <div class="status">Command State: <strong id="busy">Checking...</strong></div>
@@ -113,6 +115,22 @@
       <button id="disable" class="danger">Disable</button>
       <button id="empty">Set Empty</button>
     </div>
+
+    <h2>Payment Mode</h2>
+
+    <label>
+      Payment Mode:
+      <select id="paymentMode">
+        <option value="free_test">Free Test Mode</option>
+        <option value="bits">Bits Mode</option>
+      </select>
+    </label>
+
+    <button id="savePaymentMode">Save Payment Mode</button>
+
+    <p class="small">
+      Free Test Mode uses normal test clicks. Bits Mode waits for Twitch Bits transaction confirmation before sending the shot request.
+    </p>
 
     <h2>Manual Queue Controls</h2>
 
@@ -224,6 +242,11 @@
       return mode;
     }
 
+    function formatPaymentMode(mode) {
+      if (mode === "bits") return "Bits Mode";
+      return "Free Test Mode";
+    }
+
     function formatRandomNext(timestamp) {
       if (!timestamp) return "Not scheduled";
 
@@ -302,6 +325,11 @@
         document.getElementById("capacityDisplay").textContent = data.magazine_capacity;
         document.getElementById("capacity").value = data.magazine_capacity;
         document.getElementById("mode").textContent = formatMode(data.operation_mode);
+        document.getElementById("paymentModeDisplay").textContent =
+          formatPaymentMode(data.payment_mode || "free_test");
+        document.getElementById("paymentMode").value = data.payment_mode || "free_test";
+        document.getElementById("jwtEnforcement").textContent =
+          data.jwt_enforcement ? "On" : "Off";
         document.getElementById("connection").textContent =
           data.connection_status === "online" ? "Online" : "Offline";
         document.getElementById("streamerbot").textContent =
@@ -326,6 +354,7 @@
 
       } catch (error) {
         document.getElementById("mode").textContent = "Backend Offline";
+        document.getElementById("paymentModeDisplay").textContent = "Unknown";
         document.getElementById("connection").textContent = "Unknown";
         document.getElementById("streamerbot").textContent = "Unknown";
         document.getElementById("busy").textContent = "Unknown";
@@ -366,6 +395,13 @@
 
     document.getElementById("empty").addEventListener("click", () => {
       doAction("/api/set-empty", basePayload());
+    });
+
+    document.getElementById("savePaymentMode").addEventListener("click", () => {
+      doAction("/api/settings/payment", {
+        ...basePayload(),
+        payment_mode: document.getElementById("paymentMode").value
+      });
     });
 
     document.getElementById("addQueue1").addEventListener("click", () => {

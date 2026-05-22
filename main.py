@@ -1,12 +1,16 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from pathlib import Path
+from typing import Any
 import asyncio
+import base64
+import os
 import random
 import time
 import uuid
+import jwt
 
 app = FastAPI()
 
@@ -27,6 +31,12 @@ DEFAULT_TURRET_ID = "main"
 MODE_LIVE_FIRE = "live_fire"
 MODE_QUEUE_ONLY = "queue_only"
 MODE_DISABLED = "disabled"
+
+PAYMENT_FREE_TEST = "free_test"
+PAYMENT_BITS = "bits"
+
+TWITCH_EXTENSION_SECRET = os.getenv("TWITCH_EXTENSION_SECRET", "").strip()
+
 
 channels = {
     DEFAULT_CHANNEL_ID: {
@@ -67,6 +77,40 @@ channels = {
                 "cooldown_seconds": 0.75,
                 "max_shots_per_redeem": 10,
                 "streamerbot_action": "Nerf Turret",
+
+                # Payment behavior
+                "payment_mode": PAYMENT_FREE_TEST,
+                "bits_products": {
+                    "test_fire_1": {
+                        "sku": "test_fire_1",
+                        "name": "Test Fire 1 Dart",
+                        "shots": 1,
+                        "bits": 1,
+                        "in_development": True,
+                    },
+                    "test_fire_3": {
+                        "sku": "test_fire_3",
+                        "name": "Test Fire 3 Darts",
+                        "shots": 3,
+                        "bits": 2,
+                        "in_development": True,
+                    },
+                    "test_fire_5": {
+                        "sku": "test_fire_5",
+                        "name": "Test Fire 5 Darts",
+                        "shots": 5,
+                        "bits": 3,
+                        "in_development": True,
+                    },
+                    "test_fire_10": {
+                        "sku": "test_fire_10",
+                        "name": "Test Fire 10 Darts",
+                        "shots": 10,
+                        "bits": 5,
+                        "in_development": True,
+                    },
+                },
+                "processed_transactions": {},
 
                 "connection_status": "offline",
                 "streamerbot_status": "unknown",
@@ -133,6 +177,81 @@ class QueueSettingsRequest(BaseModel):
     random_fixed_batch_size: int = 1
 
 
+class PaymentSettingsRequest(BaseModel):
+    channel_id: str = DEFAULT_CHANNEL_ID
+    turret_id: str = DEFAULT_TURRET_ID
+    payment_mode: str
+
+
+class BitsTransactionRequest(BaseModel):
+    channel_id: str = DEFAULT_CHANNEL_ID
+    turret_id: str = DEFAULT_TURRET_ID
+    sku: str
+    transaction_id: str
+    user_id: str | None = None
+    user_name: str | None = None
+    product_cost: int | None = None
+    transaction_receipt: dict[str, Any] | None = None
+
+
+def decode_twitch_extension_jwt(authorization_header: str | None):
+    """
+    Verifies the Twitch Extension JWT if TWITCH_EXTENSION_SECRET is configured.
+
+    For early local testing, leaving TWITCH_EXTENSION_SECRET blank disables
+    enforcement. For Bits/public use, set it in Railway.
+    """
+    if not TWITCH_EXTENSION_SECRET:
+        return {
+            "ok": True,
+            "enforced": False,
+            "claims": None,
+        }
+
+    if not authorization_header:
+        return {
+            "ok": False,
+            "error": "Missing Authorization header.",
+        }
+
+    if not authorization_header.lower().startswith("bearer "):
+        return {
+            "ok": False,
+            "error": "Authorization header must use Bearer token.",
+        }
+
+    token = authorization_header.split(" ", 1)[1].strip()
+
+    try:
+        # Twitch Extension shared secrets are commonly provided as base64 strings.
+        secret_bytes = base64.b64decode(TWITCH_EXTENSION_SECRET)
+    except Exception:
+        # Fall back to raw secret bytes if decoding fails.
+        secret_bytes = TWITCH_EXTENSION_SECRET.encode("utf-8")
+
+    try:
+        claims = jwt.decode(
+            token,
+            secret_bytes,
+            algorithms=["HS256"],
+            options={
+                "verify_aud": False,
+            },
+        )
+
+        return {
+            "ok": True,
+            "enforced": True,
+            "claims": claims,
+        }
+
+    except Exception as error:
+        return {
+            "ok": False,
+            "error": f"Invalid Twitch extension JWT: {str(error)}",
+        }
+
+
 def get_turret(channel_id: str, turret_id: str):
     if channel_id not in channels:
         raise KeyError(f"Unknown channel_id: {channel_id}")
@@ -150,10 +269,6 @@ def get_connection_key(channel_id: str, turret_id: str):
 
 
 def get_unreserved_shots(turret):
-    """
-    Physical darts not already queued or pending.
-    This matters when overqueue is OFF.
-    """
     return max(
         0,
         turret["available_shots"] - turret["queued_shots"] - turret["pending_shots"]
@@ -161,10 +276,6 @@ def get_unreserved_shots(turret):
 
 
 def get_physical_fireable_shots(turret):
-    """
-    Physical darts available to fire right now.
-    Queued shots are allowed to become pending, so queued_shots are not subtracted here.
-    """
     return max(0, turret["available_shots"] - turret["pending_shots"])
 
 
@@ -598,6 +709,7 @@ def root():
         "config": "/config.html",
         "status_endpoint": "/api/status",
         "control_websocket": "/ws/control",
+        "jwt_enforcement": bool(TWITCH_EXTENSION_SECRET),
     }
 
 
@@ -652,6 +764,10 @@ def status(
         "cooldown_seconds": turret["cooldown_seconds"],
         "max_shots_per_redeem": turret["max_shots_per_redeem"],
         "streamerbot_action": turret["streamerbot_action"],
+        "payment_mode": turret["payment_mode"],
+        "bits_products": turret["bits_products"],
+        "bits_mode_active": turret["payment_mode"] == PAYMENT_BITS,
+        "jwt_enforcement": bool(TWITCH_EXTENSION_SECRET),
         "connection_status": turret["connection_status"],
         "streamerbot_status": turret["streamerbot_status"],
         "streamerbot_detail": turret["streamerbot_detail"],
@@ -697,7 +813,6 @@ async def request_shots(request: ShotRequest):
     if turret["operation_mode"] == MODE_DISABLED:
         return {"ok": False, "error": "Foam Cannon is disabled."}
 
-    # Live Fire + ready + enough physical shots = fire immediately.
     if (
         turret["operation_mode"] == MODE_LIVE_FIRE
         and not turret["is_busy"]
@@ -712,7 +827,6 @@ async def request_shots(request: ShotRequest):
         result["mode"] = MODE_LIVE_FIRE
         return result
 
-    # Otherwise, queue it if queue capacity allows.
     queue_result = add_to_queue(turret, request.count, "Viewer request")
 
     if queue_result["ok"]:
@@ -726,6 +840,97 @@ async def request_shots(request: ShotRequest):
         queue_result["mode"] = turret["operation_mode"]
 
     return queue_result
+
+
+@app.post("/api/request-shots-with-transaction")
+async def request_shots_with_transaction(
+    request: BitsTransactionRequest,
+    authorization: str | None = Header(default=None),
+):
+    try:
+        turret = get_turret(request.channel_id, request.turret_id)
+    except KeyError as error:
+        return {"ok": False, "error": str(error)}
+
+    if turret["payment_mode"] != PAYMENT_BITS:
+        return {
+            "ok": False,
+            "error": "Bits transaction received, but payment mode is not set to bits.",
+        }
+
+    jwt_result = decode_twitch_extension_jwt(authorization)
+
+    if not jwt_result["ok"]:
+        return {
+            "ok": False,
+            "error": jwt_result["error"],
+        }
+
+    if not request.transaction_id:
+        return {"ok": False, "error": "Missing transaction ID."}
+
+    if request.transaction_id in turret["processed_transactions"]:
+        return {
+            "ok": False,
+            "error": "Duplicate transaction ignored.",
+            "transaction_id": request.transaction_id,
+        }
+
+    product = turret["bits_products"].get(request.sku)
+
+    if product is None:
+        return {
+            "ok": False,
+            "error": f"Unknown Bits product SKU: {request.sku}",
+        }
+
+    expected_bits = int(product["bits"])
+
+    if request.product_cost is not None and int(request.product_cost) != expected_bits:
+        return {
+            "ok": False,
+            "error": (
+                f"Bits amount mismatch. Expected {expected_bits}, "
+                f"received {request.product_cost}."
+            ),
+        }
+
+    claims = jwt_result.get("claims") or {}
+
+    jwt_channel_id = claims.get("channel_id") or claims.get("channelId")
+    jwt_user_id = claims.get("opaque_user_id") or claims.get("user_id")
+
+    shot_count = int(product["shots"])
+
+    turret["processed_transactions"][request.transaction_id] = {
+        "sku": request.sku,
+        "shots": shot_count,
+        "bits": expected_bits,
+        "user_id": request.user_id or jwt_user_id,
+        "user_name": request.user_name,
+        "jwt_channel_id": jwt_channel_id,
+        "jwt_enforced": jwt_result.get("enforced", False),
+        "received_at": time.time(),
+        "status": "received",
+    }
+
+    result = await request_shots(ShotRequest(
+        channel_id=request.channel_id,
+        turret_id=request.turret_id,
+        count=shot_count,
+    ))
+
+    turret["processed_transactions"][request.transaction_id]["result"] = result
+    turret["processed_transactions"][request.transaction_id]["status"] = (
+        "accepted" if result.get("ok") else "failed"
+    )
+
+    result["transaction_id"] = request.transaction_id
+    result["sku"] = request.sku
+    result["bits"] = expected_bits
+    result["jwt_enforced"] = jwt_result.get("enforced", False)
+
+    return result
 
 
 @app.post("/api/fire")
@@ -827,6 +1032,31 @@ async def set_mode(request: ModeRequest):
         "ok": True,
         "message": f"Mode changed to {request.operation_mode}.",
         "operation_mode": turret["operation_mode"],
+    }
+
+
+@app.post("/api/settings/payment")
+def set_payment_settings(request: PaymentSettingsRequest):
+    try:
+        turret = get_turret(request.channel_id, request.turret_id)
+    except KeyError as error:
+        return {"ok": False, "error": str(error)}
+
+    valid_modes = {PAYMENT_FREE_TEST, PAYMENT_BITS}
+
+    if request.payment_mode not in valid_modes:
+        return {
+            "ok": False,
+            "error": "Invalid payment mode. Use free_test or bits.",
+        }
+
+    turret["payment_mode"] = request.payment_mode
+    turret["last_fire_result"] = f"Payment mode set to {request.payment_mode}."
+
+    return {
+        "ok": True,
+        "message": turret["last_fire_result"],
+        "payment_mode": turret["payment_mode"],
     }
 
 

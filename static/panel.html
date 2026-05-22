@@ -58,6 +58,18 @@
       line-height: 1.4;
     }
 
+    .bits-note {
+      border: 1px solid #9147ff;
+      background: #2d2045;
+      color: #efe6ff;
+      padding: 10px;
+      border-radius: 8px;
+      margin: 10px 0;
+      display: none;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+
     .small {
       font-size: 12px;
       opacity: 0.75;
@@ -76,12 +88,17 @@
     <div class="status">Queued Shots: <strong id="queued">?</strong></div>
     <div class="status">Available: <strong id="unreserved">?</strong></div>
     <div class="status">Mode: <strong id="mode">Loading...</strong></div>
+    <div class="status">Payment: <strong id="payment">Loading...</strong></div>
     <div class="status">Local Control: <strong id="connection">Checking...</strong></div>
     <div class="status">Streamer.bot: <strong id="streamerbot">Checking...</strong></div>
     <div class="status">Command State: <strong id="busy">Checking...</strong></div>
 
     <div id="queueNote" class="queue-note">
       Queue Mode Active: shots requested now will be saved and fired when the streamer releases the queue.
+    </div>
+
+    <div id="bitsNote" class="bits-note">
+      Bits Mode Active: Twitch will ask you to confirm before the cannon fires.
     </div>
 
     <button id="fire1">Fire 1</button>
@@ -104,10 +121,14 @@
     let pendingShots = 0;
     let unreservedShots = 0;
     let operationMode = "disabled";
+    let paymentMode = "free_test";
+    let bitsProducts = {};
     let connected = false;
     let streamerbotOnline = false;
     let isBusy = false;
     let twitchAuth = null;
+    let bitsAvailable = false;
+    let pendingBitsRequest = null;
     let activeUntil = 0;
 
     const IDLE_POLL_MS = 15000;
@@ -153,12 +174,65 @@
       return "Unavailable";
     }
 
+    function formatMode(mode) {
+      if (mode === "live_fire") return "Live Fire";
+      if (mode === "queue_only") return "Open Queue";
+      if (mode === "disabled") return "Disabled";
+      return mode;
+    }
+
+    function formatPaymentMode(mode) {
+      if (mode === "bits") return "Bits";
+      return "Free Test";
+    }
+
+    function getProductForCount(count) {
+      const preferredSku = `test_fire_${count}`;
+
+      if (bitsProducts && bitsProducts[preferredSku]) {
+        return bitsProducts[preferredSku];
+      }
+
+      if (!bitsProducts) {
+        return null;
+      }
+
+      return Object.values(bitsProducts).find((product) => {
+        return parseInt(product.shots, 10) === count;
+      }) || null;
+    }
+
+    function canUseBits() {
+      return (
+        window.Twitch &&
+        window.Twitch.ext &&
+        window.Twitch.ext.bits &&
+        typeof window.Twitch.ext.bits.useBits === "function" &&
+        bitsAvailable
+      );
+    }
+
+    function getButtonText(count) {
+      const actionVerb = getActionVerb();
+
+      if (paymentMode === "bits") {
+        const product = getProductForCount(count);
+
+        if (!product) {
+          return `Unavailable ${count}`;
+        }
+
+        return `Use ${product.bits} Bits`;
+      }
+
+      return `${actionVerb} ${count}`;
+    }
+
     function updateButtonLabels() {
-      const verb = getActionVerb();
-      document.getElementById("fire1").textContent = `${verb} 1`;
-      document.getElementById("fire3").textContent = `${verb} 3`;
-      document.getElementById("fire5").textContent = `${verb} 5`;
-      document.getElementById("fire10").textContent = `${verb} 10`;
+      document.getElementById("fire1").textContent = getButtonText(1);
+      document.getElementById("fire3").textContent = getButtonText(3);
+      document.getElementById("fire5").textContent = getButtonText(5);
+      document.getElementById("fire10").textContent = getButtonText(10);
     }
 
     function updateButtons() {
@@ -167,17 +241,23 @@
         streamerbotOnline &&
         operationMode !== "disabled";
 
-      document.getElementById("fire1").disabled = !canInteract || unreservedShots < 1;
-      document.getElementById("fire3").disabled = !canInteract || unreservedShots < 3;
-      document.getElementById("fire5").disabled = !canInteract || unreservedShots < 5;
-      document.getElementById("fire10").disabled = !canInteract || unreservedShots < 10;
-    }
+      function shouldDisable(count) {
+        if (!canInteract) return true;
+        if (unreservedShots < count) return true;
 
-    function formatMode(mode) {
-      if (mode === "live_fire") return "Live Fire";
-      if (mode === "queue_only") return "Open Queue";
-      if (mode === "disabled") return "Disabled";
-      return mode;
+        if (paymentMode === "bits") {
+          const product = getProductForCount(count);
+          if (!product) return true;
+          if (!canUseBits()) return true;
+        }
+
+        return false;
+      }
+
+      document.getElementById("fire1").disabled = shouldDisable(1);
+      document.getElementById("fire3").disabled = shouldDisable(3);
+      document.getElementById("fire5").disabled = shouldDisable(5);
+      document.getElementById("fire10").disabled = shouldDisable(10);
     }
 
     async function refreshStatus() {
@@ -193,6 +273,8 @@
         pendingShots = data.pending_shots;
         unreservedShots = data.unreserved_shots;
         operationMode = data.operation_mode;
+        paymentMode = data.payment_mode || "free_test";
+        bitsProducts = data.bits_products || {};
         connected = data.connection_status === "online";
         streamerbotOnline = data.streamerbot_status === "online";
         isBusy = data.is_busy === true;
@@ -202,6 +284,7 @@
         document.getElementById("queued").textContent = queuedShots;
         document.getElementById("unreserved").textContent = unreservedShots;
         document.getElementById("mode").textContent = formatMode(operationMode);
+        document.getElementById("payment").textContent = formatPaymentMode(paymentMode);
         document.getElementById("connection").textContent = connected ? "Online" : "Offline";
         document.getElementById("streamerbot").textContent = streamerbotOnline ? "Online" : "Offline";
         document.getElementById("busy").textContent = isBusy ? "Firing..." : "Ready";
@@ -209,14 +292,23 @@
         document.getElementById("queueNote").style.display =
           operationMode === "queue_only" ? "block" : "none";
 
+        document.getElementById("bitsNote").style.display =
+          paymentMode === "bits" ? "block" : "none";
+
         document.getElementById("message").textContent =
           data.viewer_message || data.last_fire_result || "Ready.";
+
+        if (paymentMode === "bits" && !canUseBits()) {
+          document.getElementById("message").textContent =
+            "Bits Mode is active, but Bits are not available in this view.";
+        }
 
         updateButtonLabels();
         updateButtons();
 
       } catch (error) {
         document.getElementById("mode").textContent = "Backend Offline";
+        document.getElementById("payment").textContent = "Unknown";
         document.getElementById("connection").textContent = "Unknown";
         document.getElementById("streamerbot").textContent = "Unknown";
         document.getElementById("busy").textContent = "Unknown";
@@ -226,6 +318,8 @@
         pendingShots = 0;
         unreservedShots = 0;
         operationMode = "disabled";
+        paymentMode = "free_test";
+        bitsProducts = {};
         connected = false;
         streamerbotOnline = false;
         isBusy = false;
@@ -237,6 +331,11 @@
     async function requestShots(count) {
       try {
         markActive();
+
+        if (paymentMode === "bits") {
+          requestShotsWithBits(count);
+          return;
+        }
 
         const verb = getActionVerb();
         document.getElementById("message").textContent = `${verb} request for ${count} shot(s)...`;
@@ -263,6 +362,34 @@
       }
     }
 
+    function requestShotsWithBits(count) {
+      const product = getProductForCount(count);
+
+      if (!product) {
+        document.getElementById("message").textContent =
+          `No Bits product configured for ${count} shot(s).`;
+        return;
+      }
+
+      if (!canUseBits()) {
+        document.getElementById("message").textContent =
+          "Bits are not available in this view. Open the panel through Twitch.";
+        return;
+      }
+
+      pendingBitsRequest = {
+        count: count,
+        sku: product.sku,
+        bits: product.bits,
+        created_at: Date.now()
+      };
+
+      document.getElementById("message").textContent =
+        `Opening Twitch Bits confirmation for ${product.bits} Bits...`;
+
+      window.Twitch.ext.bits.useBits(product.sku);
+    }
+
     document.getElementById("fire1").addEventListener("click", () => requestShots(1));
     document.getElementById("fire3").addEventListener("click", () => requestShots(3));
     document.getElementById("fire5").addEventListener("click", () => requestShots(5));
@@ -287,9 +414,76 @@
       }, delay);
     }
 
+    if (window.Twitch && window.Twitch.ext && window.Twitch.ext.bits) {
+      window.Twitch.ext.bits.onTransactionComplete(async function(transaction) {
+        try {
+          const productSku =
+            transaction?.product?.sku ||
+            transaction?.sku ||
+            pendingBitsRequest?.sku;
+
+          const transactionId =
+            transaction?.transactionId ||
+            transaction?.id ||
+            `${productSku}-${Date.now()}`;
+
+          const product = bitsProducts[productSku] || pendingBitsRequest;
+
+          if (!productSku || !product) {
+            document.getElementById("message").textContent =
+              "Bits transaction completed, but product could not be matched.";
+            pendingBitsRequest = null;
+            await refreshStatus();
+            return;
+          }
+
+          document.getElementById("message").textContent =
+            "Bits transaction complete. Sending shot request...";
+
+          const data = await apiPost("/api/request-shots-with-transaction", {
+            channel_id: CHANNEL_ID,
+            turret_id: TURRET_ID,
+            sku: productSku,
+            transaction_id: transactionId,
+            user_id: twitchAuth ? twitchAuth.userId : null,
+            user_name: null,
+            product_cost: product.bits || transaction?.product?.cost?.amount || null,
+            transaction_receipt: transaction
+          });
+
+          if (!data.ok) {
+            document.getElementById("message").textContent =
+              data.error || "Transaction received, but shot request failed.";
+          } else {
+            document.getElementById("message").textContent =
+              data.message || "Bits accepted. Shot request sent.";
+          }
+
+          pendingBitsRequest = null;
+          await refreshStatus();
+
+        } catch (error) {
+          document.getElementById("message").textContent =
+            "Bits transaction completed, but the shot request failed.";
+          pendingBitsRequest = null;
+          await refreshStatus();
+        }
+      });
+
+      window.Twitch.ext.bits.onTransactionCancelled(function() {
+        pendingBitsRequest = null;
+        document.getElementById("message").textContent =
+          "Bits transaction cancelled.";
+      });
+    }
+
     if (window.Twitch && window.Twitch.ext) {
       window.Twitch.ext.onAuthorized(function(auth) {
         twitchAuth = auth;
+
+        if (window.Twitch.ext.features) {
+          bitsAvailable = window.Twitch.ext.features.isBitsEnabled === true;
+        }
 
         document.getElementById("debug").textContent =
           "Authorized | Channel ID: " + auth.channelId +
