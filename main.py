@@ -37,6 +37,10 @@ PAYMENT_BITS = "bits"
 
 TWITCH_EXTENSION_SECRET = os.getenv("TWITCH_EXTENSION_SECRET", "").strip()
 
+# For production/Railway, set FOAM_CONTROL_TOKEN as an environment variable.
+# The "goldfish" fallback is only for local testing.
+FOAM_CONTROL_TOKEN = os.getenv("FOAM_CONTROL_TOKEN", "goldfish").strip()
+
 MAX_EVENT_LOG = 100
 
 
@@ -79,6 +83,9 @@ channels = {
                 "cooldown_seconds": 0.75,
                 "max_shots_per_redeem": 10,
                 "streamerbot_action": "Nerf Turret",
+
+                # Local-control pairing/security
+                "control_token": FOAM_CONTROL_TOKEN,
 
                 # Payment behavior
                 "payment_mode": PAYMENT_FREE_TEST,
@@ -199,7 +206,13 @@ class BitsTransactionRequest(BaseModel):
     transaction_receipt: dict[str, Any] | None = None
 
 
-def log_event(turret, event_type: str, message: str, level: str = "info", extra: dict[str, Any] | None = None):
+def log_event(
+    turret,
+    event_type: str,
+    message: str,
+    level: str = "info",
+    extra: dict[str, Any] | None = None,
+):
     event = {
         "timestamp": time.time(),
         "event_type": event_type,
@@ -288,10 +301,25 @@ def get_connection_key(channel_id: str, turret_id: str):
     return f"{channel_id}:{turret_id}"
 
 
+def verify_control_token(turret, provided_token: str | None):
+    expected_token = turret.get("control_token", "")
+
+    if not expected_token:
+        return False, "No control token is configured on the EBS."
+
+    if not provided_token:
+        return False, "No control token was provided by local-control."
+
+    if provided_token != expected_token:
+        return False, "Invalid control token."
+
+    return True, "Control token accepted."
+
+
 def get_unreserved_shots(turret):
     return max(
         0,
-        turret["available_shots"] - turret["queued_shots"] - turret["pending_shots"]
+        turret["available_shots"] - turret["queued_shots"] - turret["pending_shots"],
     )
 
 
@@ -387,6 +415,7 @@ def format_setup_checks(turret):
     has_loaded_shots = turret["available_shots"] > 0
     not_busy = not turret["is_busy"]
     payment_selected = turret["payment_mode"] in {PAYMENT_FREE_TEST, PAYMENT_BITS}
+    pairing_token_configured = bool(turret.get("control_token"))
 
     return [
         {
@@ -430,6 +459,12 @@ def format_setup_checks(turret):
             "label": "Payment mode selected",
             "ok": payment_selected,
             "detail": f"Payment mode: {turret['payment_mode']}.",
+        },
+        {
+            "key": "pairing_token",
+            "label": "Pairing token configured",
+            "ok": pairing_token_configured,
+            "detail": "Configured." if pairing_token_configured else "Missing local-control pairing token.",
         },
         {
             "key": "jwt",
@@ -511,7 +546,7 @@ async def send_fire_command(channel_id: str, turret_id: str, count: int, source:
         turret["connection_status"] = "offline"
         auto_disable_turret(
             turret,
-            "Auto-disabled because no active local control connection was found."
+            "Auto-disabled because no active local control connection was found.",
         )
         return {
             "ok": False,
@@ -521,7 +556,7 @@ async def send_fire_command(channel_id: str, turret_id: str, count: int, source:
     if turret["streamerbot_status"] != "online":
         auto_disable_turret(
             turret,
-            f"Auto-disabled because Streamer.bot is offline. {turret['streamerbot_detail']}"
+            f"Auto-disabled because Streamer.bot is offline. {turret['streamerbot_detail']}",
         )
         return {
             "ok": False,
@@ -599,7 +634,7 @@ async def send_fire_command(channel_id: str, turret_id: str, count: int, source:
         turret["connection_status"] = "offline"
         auto_disable_turret(
             turret,
-            f"Auto-disabled because sending the fire command failed: {str(error)}"
+            f"Auto-disabled because sending the fire command failed: {str(error)}",
         )
         return {
             "ok": False,
@@ -837,7 +872,7 @@ async def apply_fire_result(channel_id: str, turret_id: str, command_id: str, ok
             (
                 f"Command {command_id} result: FAILED. "
                 f"No shots were deducted. Foam Cannon auto-disabled. {detail}"
-            )
+            ),
         )
 
 
@@ -852,6 +887,7 @@ def root():
         "events_endpoint": "/api/events",
         "control_websocket": "/ws/control",
         "jwt_enforcement": bool(TWITCH_EXTENSION_SECRET),
+        "pairing_token_configured": bool(FOAM_CONTROL_TOKEN),
     }
 
 
@@ -929,6 +965,7 @@ def status(
         "bits_products": turret["bits_products"],
         "bits_mode_active": turret["payment_mode"] == PAYMENT_BITS,
         "jwt_enforcement": bool(TWITCH_EXTENSION_SECRET),
+        "pairing_token_configured": bool(turret.get("control_token")),
         "setup_checks": format_setup_checks(turret),
         "recent_events": get_recent_events(turret, 15),
         "connection_status": turret["connection_status"],
@@ -962,14 +999,14 @@ async def request_shots(request: ShotRequest):
     if turret["connection_status"] != "online":
         auto_disable_turret(
             turret,
-            "Auto-disabled because the local control client is offline."
+            "Auto-disabled because the local control client is offline.",
         )
         return {"ok": False, "error": "Local control client is offline."}
 
     if turret["streamerbot_status"] != "online":
         auto_disable_turret(
             turret,
-            f"Auto-disabled because Streamer.bot is offline. {turret['streamerbot_detail']}"
+            f"Auto-disabled because Streamer.bot is offline. {turret['streamerbot_detail']}",
         )
         return {"ok": False, "error": f"Streamer.bot is offline. {turret['streamerbot_detail']}"}
 
@@ -1490,7 +1527,7 @@ async def fire_queue(request: FireQueueRequest):
     if not local_system_ready(turret):
         auto_disable_turret(
             turret,
-            "Auto-disabled because local control or Streamer.bot is offline."
+            "Auto-disabled because local control or Streamer.bot is offline.",
         )
         return {"ok": False, "error": "Local control or Streamer.bot is offline."}
 
@@ -1555,6 +1592,7 @@ async def control_socket(websocket: WebSocket):
 
         channel_id = hello.get("channel_id", DEFAULT_CHANNEL_ID)
         turret_id = hello.get("turret_id", DEFAULT_TURRET_ID)
+        provided_control_token = hello.get("control_token")
 
         try:
             turret = get_turret(channel_id, turret_id)
@@ -1565,6 +1603,32 @@ async def control_socket(websocket: WebSocket):
             })
             await websocket.close()
             return
+
+        token_ok, token_message = verify_control_token(turret, provided_control_token)
+
+        if not token_ok:
+            log_event(
+                turret,
+                "pairing_rejected",
+                f"Local-control pairing rejected: {token_message}",
+                "error",
+                {"channel_id": channel_id, "turret_id": turret_id},
+            )
+
+            await websocket.send_json({
+                "type": "error",
+                "error": token_message,
+            })
+            await websocket.close()
+            return
+
+        log_event(
+            turret,
+            "pairing_accepted",
+            "Local-control pairing token accepted.",
+            "success",
+            {"channel_id": channel_id, "turret_id": turret_id},
+        )
 
         connection_key = get_connection_key(channel_id, turret_id)
         control_connections[connection_key] = websocket
@@ -1591,7 +1655,7 @@ async def control_socket(websocket: WebSocket):
         if turret["streamerbot_status"] != "online":
             auto_disable_turret(
                 turret,
-                f"Auto-disabled because Streamer.bot is offline. {turret['streamerbot_detail']}"
+                f"Auto-disabled because Streamer.bot is offline. {turret['streamerbot_detail']}",
             )
 
         await websocket.send_json({
@@ -1620,7 +1684,7 @@ async def control_socket(websocket: WebSocket):
                     )
                     auto_disable_turret(
                         turret,
-                        f"Auto-disabled because Streamer.bot is offline. {turret['streamerbot_detail']}"
+                        f"Auto-disabled because Streamer.bot is offline. {turret['streamerbot_detail']}",
                     )
 
                 elif previous_streamerbot_status != "online":
@@ -1637,6 +1701,12 @@ async def control_socket(websocket: WebSocket):
             if message.get("type") == "heartbeat":
                 await websocket.send_json({
                     "type": "heartbeat_ack",
+                    "time": time.time(),
+                })
+
+            elif message.get("type") == "status":
+                await websocket.send_json({
+                    "type": "status_ack",
                     "time": time.time(),
                 })
 
@@ -1674,7 +1744,7 @@ async def control_socket(websocket: WebSocket):
                 turret["streamerbot_detail"] = "Local control client disconnected."
                 auto_disable_turret(
                     turret,
-                    "Auto-disabled because local control client disconnected."
+                    "Auto-disabled because local control client disconnected.",
                 )
             except KeyError:
                 pass
