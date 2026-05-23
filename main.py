@@ -12,7 +12,23 @@ import time
 import uuid
 import jwt
 
+from persistence import (
+    init_db,
+    load_turret_state,
+    save_turret_state,
+    persist_event,
+    load_recent_events as db_load_recent_events,
+    persist_transaction,
+    transaction_exists,
+    persistence_enabled,
+)
+
 app = FastAPI()
+
+@app.on_event("startup")
+def startup():
+    init_db()
+    load_all_persisted_state()
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -51,6 +67,8 @@ channels = {
                 "display_name": "Kaizen Foam Cannon",
                 "gun_type": "Swarmfire",
                 "magazine_capacity": 20,
+                "channel_id": DEFAULT_CHANNEL_ID,
+                "turret_id": DEFAULT_TURRET_ID,
 
                 # Physical darts assumed loaded.
                 "available_shots": 20,
@@ -213,20 +231,139 @@ def log_event(
     level: str = "info",
     extra: dict[str, Any] | None = None,
 ):
+    if extra is None:
+        extra = {}
+
     event = {
         "timestamp": time.time(),
         "event_type": event_type,
         "level": level,
         "message": message,
-        "extra": extra or {},
+        "extra": extra,
     }
 
     turret.setdefault("event_log", []).insert(0, event)
     turret["event_log"] = turret["event_log"][:MAX_EVENT_LOG]
 
+    channel_id = turret.get("channel_id", DEFAULT_CHANNEL_ID)
+    turret_id = turret.get("turret_id", DEFAULT_TURRET_ID)
+
+    persist_event(
+        channel_id=channel_id,
+        turret_id=turret_id,
+        event_type=event_type,
+        level=level,
+        message=message,
+        extra=extra,
+        event_timestamp=event["timestamp"],
+    )
+
 
 def get_recent_events(turret, limit: int = 25):
+    channel_id = turret.get("channel_id", DEFAULT_CHANNEL_ID)
+    turret_id = turret.get("turret_id", DEFAULT_TURRET_ID)
+
+    if persistence_enabled():
+        events = db_load_recent_events(channel_id, turret_id, limit)
+        if events:
+            return events
+
     return turret.get("event_log", [])[:limit]
+
+PERSISTED_STATE_KEYS = [
+    "display_name",
+    "gun_type",
+    "magazine_capacity",
+    "available_shots",
+    "queued_shots",
+    "operation_mode",
+    "auto_fire_queue",
+    "allow_overqueue",
+    "max_queue_size",
+    "random_queue_release",
+    "random_min_seconds",
+    "random_max_seconds",
+    "random_burst_enabled",
+    "random_burst_min",
+    "random_burst_max",
+    "random_fixed_batch_size",
+    "cooldown_seconds",
+    "max_shots_per_redeem",
+    "streamerbot_action",
+    "payment_mode",
+    "bits_products",
+]
+
+
+def get_state_snapshot(turret):
+    snapshot = {}
+
+    for key in PERSISTED_STATE_KEYS:
+        if key in turret:
+            snapshot[key] = turret[key]
+
+    return snapshot
+
+
+def save_state_for_turret(turret):
+    channel_id = turret.get("channel_id", DEFAULT_CHANNEL_ID)
+    turret_id = turret.get("turret_id", DEFAULT_TURRET_ID)
+
+    save_turret_state(
+        channel_id=channel_id,
+        turret_id=turret_id,
+        state=get_state_snapshot(turret),
+    )
+
+
+def apply_persisted_state(turret, persisted_state):
+    if not persisted_state:
+        return
+
+    for key in PERSISTED_STATE_KEYS:
+        if key in persisted_state:
+            turret[key] = persisted_state[key]
+
+    # Safety reset: never restore volatile live state as if it were still true.
+    turret["connection_status"] = "offline"
+    turret["streamerbot_status"] = "unknown"
+    turret["streamerbot_detail"] = "Waiting for local control client after EBS restart."
+    turret["is_busy"] = False
+    turret["pending_shots"] = 0
+    turret["pending_commands"] = {}
+    turret["random_release_next_at"] = None
+
+    # Safety choice: after an EBS restart, do not auto-arm.
+    if turret["operation_mode"] != MODE_DISABLED:
+        turret["operation_mode"] = MODE_DISABLED
+        turret["enabled"] = False
+        turret["last_fire_result"] = "State restored after restart. Cannon disabled for safety."
+
+
+def load_all_persisted_state():
+    for channel_id, channel_data in channels.items():
+        for turret_id, turret in channel_data.get("turrets", {}).items():
+            turret["channel_id"] = channel_id
+            turret["turret_id"] = turret_id
+
+            persisted_state = load_turret_state(channel_id, turret_id)
+
+            if persisted_state:
+                apply_persisted_state(turret, persisted_state)
+                log_event(
+                    turret,
+                    "state_restored",
+                    "Persisted turret state restored. Cannon disabled for safety.",
+                    "success",
+                )
+            else:
+                save_state_for_turret(turret)
+                log_event(
+                    turret,
+                    "state_initialized",
+                    "Initial turret state saved to persistence.",
+                    "info",
+                )
 
 
 def decode_twitch_extension_jwt(authorization_header: str | None):
@@ -354,6 +491,7 @@ def auto_disable_turret(turret, reason: str):
     turret["random_release_next_at"] = None
     turret["last_fire_result"] = reason
     log_event(turret, "auto_disable", reason, "warning")
+    save_state_for_turret(turret)
 
 
 def get_can_fire_now(turret):
@@ -525,6 +663,7 @@ def add_to_queue(turret, count: int, source_label: str):
         "info",
         {"count": count, "source": source_label},
     )
+    save_state_for_turret(turret)
 
     return {
         "ok": True,
@@ -853,6 +992,7 @@ async def apply_fire_result(channel_id: str, turret_id: str, command_id: str, ok
             "success",
             {"command_id": command_id, "count": count, "source": source, "detail": detail},
         )
+        save_state_for_turret(turret)
 
         await start_next_queued_batch_if_allowed(channel_id, turret_id)
 
@@ -1083,7 +1223,7 @@ async def request_shots_with_transaction(
     if not request.transaction_id:
         return {"ok": False, "error": "Missing transaction ID."}
 
-    if request.transaction_id in turret["processed_transactions"]:
+    if request.transaction_id in turret["processed_transactions"] or transaction_exists(request.transaction_id):
         log_event(
             turret,
             "bits_duplicate",
@@ -1149,6 +1289,21 @@ async def request_shots_with_transaction(
         },
     )
 
+    persist_transaction(
+        transaction_id=request.transaction_id,
+        channel_id=request.channel_id,
+        turret_id=request.turret_id,
+        sku=request.sku,
+        bits=expected_bits,
+        shots=shot_count,
+        status="received",
+        user_id=request.user_id or jwt_user_id,
+        user_name=request.user_name,
+        jwt_channel_id=jwt_channel_id,
+        jwt_enforced=jwt_result.get("enforced", False),
+        received_at=turret["processed_transactions"][request.transaction_id]["received_at"],
+    )
+
     result = await request_shots(ShotRequest(
         channel_id=request.channel_id,
         turret_id=request.turret_id,
@@ -1175,6 +1330,22 @@ async def request_shots_with_transaction(
             "sku": request.sku,
             "result": result,
         },
+    )
+
+    persist_transaction(
+        transaction_id=request.transaction_id,
+        channel_id=request.channel_id,
+        turret_id=request.turret_id,
+        sku=request.sku,
+        bits=expected_bits,
+        shots=shot_count,
+        status="accepted" if result.get("ok") else "failed",
+        user_id=request.user_id or jwt_user_id,
+        user_name=request.user_name,
+        jwt_channel_id=jwt_channel_id,
+        jwt_enforced=jwt_result.get("enforced", False),
+        received_at=turret["processed_transactions"][request.transaction_id]["received_at"],
+        result=result,
     )
 
     return result
@@ -1240,6 +1411,7 @@ def reload(request: ReloadRequest):
         "success",
         {"capacity": request.capacity, "queued_shots": turret["queued_shots"]},
     )
+    save_state_for_turret(turret)
 
     return {
         "ok": True,
@@ -1289,6 +1461,7 @@ async def set_mode(request: ModeRequest):
         "info",
         {"previous_mode": previous_mode, "new_mode": request.operation_mode},
     )
+    save_state_for_turret(turret)
 
     if request.operation_mode == MODE_LIVE_FIRE:
         await start_next_queued_batch_if_allowed(request.channel_id, request.turret_id)
@@ -1327,6 +1500,7 @@ def set_payment_settings(request: PaymentSettingsRequest):
         "info",
         {"previous_mode": previous_mode, "new_mode": request.payment_mode},
     )
+    save_state_for_turret(turret)
 
     return {
         "ok": True,
@@ -1392,6 +1566,7 @@ async def set_queue_settings(request: QueueSettingsRequest):
             "random_fixed_batch_size": request.random_fixed_batch_size,
         },
     )
+    save_state_for_turret(turret)
 
     schedule_random_release_if_needed(request.channel_id, request.turret_id)
 
@@ -1418,6 +1593,7 @@ async def set_auto_fire_queue(request: AutoFireQueueRequest):
     )
 
     log_event(turret, "auto_fire_queue", turret["last_fire_result"], "info")
+    save_state_for_turret(turret)
 
     await start_next_queued_batch_if_allowed(request.channel_id, request.turret_id)
 
@@ -1476,6 +1652,7 @@ def set_empty(request: TurretActionRequest):
     turret["last_fire_result"] = "Shot count set to empty. Queue cleared."
 
     log_event(turret, "set_empty", "Shot count set to empty. Queue cleared.", "warning")
+    save_state_for_turret(turret)
 
     return {
         "ok": True,
@@ -1506,6 +1683,7 @@ def clear_queue(request: TurretActionRequest):
     turret["last_fire_result"] = "Queue cleared."
 
     log_event(turret, "queue_clear", f"Queue cleared. Removed {cleared_count} shot(s).", "warning")
+    save_state_for_turret(turret)
 
     return {
         "ok": True,
