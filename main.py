@@ -12,6 +12,12 @@ import time
 import uuid
 import jwt
 
+from twitch_api import (
+    twitch_configured,
+    get_user_by_login,
+    get_stream_status_by_user_id,
+)
+
 from persistence import (
     init_db,
     load_turret_state,
@@ -22,6 +28,10 @@ from persistence import (
     transaction_exists,
     persistence_enabled,
 )
+
+BROADCASTER_TWITCH_LOGIN = os.getenv("BROADCASTER_TWITCH_LOGIN", "").strip()
+STREAM_GATE_ENABLED = os.getenv("STREAM_GATE_ENABLED", "false").strip().lower() == "true"
+STREAM_STATUS_CACHE_SECONDS = int(os.getenv("STREAM_STATUS_CACHE_SECONDS", "120"))
 
 app = FastAPI()
 
@@ -43,6 +53,8 @@ app.add_middleware(
 
 DEFAULT_CHANNEL_ID = "local_test"
 DEFAULT_TURRET_ID = "main"
+
+
 
 MODE_LIVE_FIRE = "live_fire"
 MODE_QUEUE_ONLY = "queue_only"
@@ -69,6 +81,13 @@ channels = {
                 "magazine_capacity": 20,
                 "channel_id": DEFAULT_CHANNEL_ID,
                 "turret_id": DEFAULT_TURRET_ID,
+		"twitch_login": BROADCASTER_TWITCH_LOGIN,
+                "twitch_user_id": None,
+                "stream_gate_enabled": STREAM_GATE_ENABLED,
+                "stream_status": "unknown",
+                "stream_is_live": None,
+                "stream_status_checked_at": None,
+                "stream_status_detail": "Stream status has not been checked yet.",
 
                 # Physical darts assumed loaded.
                 "available_shots": 20,
@@ -292,6 +311,9 @@ PERSISTED_STATE_KEYS = [
     "streamerbot_action",
     "payment_mode",
     "bits_products",
+    "twitch_login",
+    "twitch_user_id",
+    "stream_gate_enabled",
 ]
 
 
@@ -365,6 +387,84 @@ def load_all_persisted_state():
                     "info",
                 )
 
+async def refresh_stream_status_for_turret(turret, force: bool = False):
+    now = time.time()
+
+    if not turret.get("stream_gate_enabled"):
+        turret["stream_status"] = "disabled"
+        turret["stream_is_live"] = True
+        turret["stream_status_detail"] = "Stream gate disabled."
+        return
+
+    if not twitch_configured():
+        turret["stream_status"] = "unknown"
+        turret["stream_is_live"] = None
+        turret["stream_status_detail"] = "Twitch API credentials are not configured."
+        return
+
+    last_checked = turret.get("stream_status_checked_at")
+
+    if (
+        not force
+        and last_checked
+        and now - float(last_checked) < STREAM_STATUS_CACHE_SECONDS
+    ):
+        return
+
+    try:
+        twitch_login = turret.get("twitch_login") or BROADCASTER_TWITCH_LOGIN
+
+        if not twitch_login:
+            turret["stream_status"] = "unknown"
+            turret["stream_is_live"] = None
+            turret["stream_status_detail"] = "No broadcaster Twitch login configured."
+            turret["stream_status_checked_at"] = now
+            return
+
+        if not turret.get("twitch_user_id"):
+            user = await get_user_by_login(twitch_login)
+
+            if not user:
+                turret["stream_status"] = "unknown"
+                turret["stream_is_live"] = None
+                turret["stream_status_detail"] = f"Twitch user not found: {twitch_login}."
+                turret["stream_status_checked_at"] = now
+                return
+
+            turret["twitch_user_id"] = user["id"]
+            save_state_for_turret(turret)
+
+        status = await get_stream_status_by_user_id(turret["twitch_user_id"])
+
+        turret["stream_is_live"] = bool(status["is_live"])
+        turret["stream_status"] = "live" if status["is_live"] else "offline"
+        turret["stream_status_checked_at"] = now
+        turret["stream_status_detail"] = (
+            "Stream is live."
+            if status["is_live"]
+            else "Stream is offline."
+        )
+
+    except Exception as error:
+        turret["stream_status"] = "unknown"
+        turret["stream_is_live"] = None
+        turret["stream_status_checked_at"] = now
+        turret["stream_status_detail"] = f"Stream status check failed: {str(error)}"
+
+
+async def stream_gate_allows_fire(turret):
+    await refresh_stream_status_for_turret(turret)
+
+    if not turret.get("stream_gate_enabled"):
+        return True, "Stream gate disabled."
+
+    if turret.get("stream_is_live") is True:
+        return True, "Stream is live."
+
+    if turret.get("stream_is_live") is False:
+        return False, "Streamer is offline. Foam Cannon is unavailable."
+
+    return False, turret.get("stream_status_detail") or "Stream status unknown."
 
 def decode_twitch_extension_jwt(authorization_header: str | None):
     """
@@ -1061,7 +1161,7 @@ def events(
 
 
 @app.get("/api/status")
-def status(
+async def status(
     channel_id: str = DEFAULT_CHANNEL_ID,
     turret_id: str = DEFAULT_TURRET_ID,
 ):
@@ -1071,6 +1171,8 @@ def status(
         return {"ok": False, "error": str(error)}
 
     turret["enabled"] = is_enabled(turret)
+
+    await refresh_stream_status_for_turret(turret)
 
     return {
         "ok": True,
@@ -1104,6 +1206,19 @@ def status(
         "payment_mode": turret["payment_mode"],
         "bits_products": turret["bits_products"],
         "bits_mode_active": turret["payment_mode"] == PAYMENT_BITS,
+
+        # Stream live/offline gate
+        "stream_gate_enabled": turret.get("stream_gate_enabled", False),
+        "twitch_login": turret.get("twitch_login"),
+        "twitch_user_id": turret.get("twitch_user_id"),
+        "stream_status": turret.get("stream_status", "unknown"),
+        "stream_is_live": turret.get("stream_is_live"),
+        "stream_status_checked_at": turret.get("stream_status_checked_at"),
+        "stream_status_detail": turret.get(
+            "stream_status_detail",
+            "Stream status has not been checked yet."
+        ),
+
         "jwt_enforcement": bool(TWITCH_EXTENSION_SECRET),
         "pairing_token_configured": bool(turret.get("control_token")),
         "setup_checks": format_setup_checks(turret),
@@ -1152,6 +1267,18 @@ async def request_shots(request: ShotRequest):
 
     if turret["operation_mode"] == MODE_DISABLED:
         return {"ok": False, "error": "Foam Cannon is disabled."}
+
+    gate_ok, gate_message = await stream_gate_allows_fire(turret)
+
+    if not gate_ok:
+        log_event(
+            turret,
+            "stream_gate_blocked",
+            gate_message,
+            "warning",
+        )
+        return {"ok": False, "error": gate_message}
+
 
     if (
         turret["operation_mode"] == MODE_LIVE_FIRE
